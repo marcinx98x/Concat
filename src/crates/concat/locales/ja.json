@@ -903,6 +903,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "ミュート",
+  "studio.noCutAtPlayhead": "現在の位置に連続したクリップがありません。トランジションを追加できませんでした。",
   "studio.noRoomForTransition": "ここにはトランジションを入れる余地がありません。両方のクリップが少なくとも1フレーム必要です",
   "studio.notAFont": "{0} は Concat が読み込めるフォントではありません",
   "studio.openProject": "Open project…",

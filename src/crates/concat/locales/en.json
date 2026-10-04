@@ -903,6 +903,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "Mute",
+  "studio.noCutAtPlayhead": "There are no continuous clips at current position. Couldn't add transition.",
   "studio.noRoomForTransition": "There's no room for a transition here: both clips need to be at least a frame long",
   "studio.notAFont": "{0} is not a font Concat can read",
   "studio.openProject": "Open project…",

@@ -903,6 +903,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "Stumm",
+  "studio.noCutAtPlayhead": "An der aktuellen Position gibt es keine aneinandergrenzenden Clips. Übergang konnte nicht hinzugefügt werden.",
   "studio.noRoomForTransition": "Hier ist kein Platz für einen Übergang: beide Clips müssen mindestens ein Bild lang sein",
   "studio.notAFont": "{0} ist keine Schrift, die Concat lesen kann",
   "studio.openProject": "Open project…",

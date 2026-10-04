@@ -903,6 +903,7 @@
   "studio.lut": "LUT",
   "studio.mono": "Mono",
   "studio.mute": "بی‌صدا",
+  "studio.noCutAtPlayhead": "در موقعیت فعلی کلیپ‌های پیوسته‌ای وجود ندارد. افزودن ترنزیشن ممکن نشد.",
   "studio.noRoomForTransition": "اینجا جایی برای گذار نیست: هر دو کلیپ باید دست‌کم یک فریم طول داشته باشند",
   "studio.notAFont": "{0} قلمی نیست که Concat بتواند بخواند",
   "studio.openProject": "باز کردن پروژه…",
