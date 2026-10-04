@@ -612,15 +612,7 @@ fn resolve_transitions(clips: &mut Vec<ExportClip>, rate: FrameRate) -> Vec<Tran
                     // which settles from a little large to its own size.
                     "zoom" => {
                         rides(clips, cut.outgoing, incoming, "scale")
-                            && ride(
-                                &mut clips[incoming],
-                                "scale",
-                                1.25,
-                                1.0,
-                                d,
-                                true,
-                                EASE_OUT,
-                            )
+                            && ride(&mut clips[incoming], "scale", 1.25, 1.0, d, true, EASE_OUT)
                             && ride(
                                 &mut clips[cut.outgoing],
                                 "scale",
@@ -2070,7 +2062,11 @@ mod tests {
         assert_eq!(big, (4000, 2000), "never shrunk below the fitted size");
 
         let unknown = still_cover((1920, 1080), (1920, 1080));
-        assert_eq!(unknown, (1920, 1080), "a full-frame fallback is left as it was");
+        assert_eq!(
+            unknown,
+            (1920, 1080),
+            "a full-frame fallback is left as it was"
+        );
     }
 
     /// A treatment on track 1 runs over what track 0 drew and not over what
@@ -2562,7 +2558,10 @@ mod tests {
         assert_eq!((b.start, b.duration, b.source_start), (4.0, 4.0, 0.0));
         assert_eq!(b.video_fade_in, 0.0);
         let hold = &clips[2];
-        assert_eq!((hold.start, hold.duration, hold.source_start), (3.0, 1.0, 0.0));
+        assert_eq!(
+            (hold.start, hold.duration, hold.source_start),
+            (3.0, 1.0, 0.0)
+        );
         assert_eq!(hold.video_fade_in, 1.0);
     }
 
@@ -2613,10 +2612,20 @@ mod tests {
 
         let hold = &clips[2];
         assert_eq!(keys_on(hold, "offsetX"), vec![(0.0, 1.0), (1.0, 0.0)]);
-        assert!(keys_on(hold, "scale").is_empty(), "the ride stays on the clip");
+        assert!(
+            keys_on(hold, "scale").is_empty(),
+            "the ride stays on the clip"
+        );
         assert_eq!(hold.scale, 2.0, "held where the ride starts");
-        assert_eq!(keys_on(&clips[0], "offsetX"), vec![(0.75, 0.0), (1.0, -1.0)]);
-        assert_eq!(keys_on(&clips[1], "scale").len(), 2, "the user's keys are untouched");
+        assert_eq!(
+            keys_on(&clips[0], "offsetX"),
+            vec![(0.75, 0.0), (1.0, -1.0)]
+        );
+        assert_eq!(
+            keys_on(&clips[1], "scale").len(),
+            2,
+            "the user's keys are untouched"
+        );
         assert!(keys_on(&clips[1], "offsetX").is_empty());
     }
 

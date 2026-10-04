@@ -395,7 +395,10 @@ mod tests {
             "all the way out shows the whole cut"
         );
         view.fit(two_hours, view.width);
-        assert!(view.width * view.seconds_per_pixel >= two_hours, "and so does fit");
+        assert!(
+            view.width * view.seconds_per_pixel >= two_hours,
+            "and so does fit"
+        );
         assert_eq!(view.scroll_left, 0.0);
     }
 

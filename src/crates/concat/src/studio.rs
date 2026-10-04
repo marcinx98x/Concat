@@ -2110,9 +2110,9 @@ impl Studio {
                         // A title is its name strip alone; a layer has no
                         // picture at all; a shape's name says what it is.
                         // None needs a body's height.
-                        model::ClipKind::Text
-                        | model::ClipKind::Layer
-                        | model::ClipKind::Shape => LANE_SMALL,
+                        model::ClipKind::Text | model::ClipKind::Layer | model::ClipKind::Shape => {
+                            LANE_SMALL
+                        }
                     })
                     .fold(0.0_f32, f32::max);
                 if tallest > 0.0 { tallest } else { LANE_MEDIUM }
@@ -3242,7 +3242,9 @@ impl Studio {
     /// None - the drop refused - off any cut, on a locked lane, or on a cut
     /// with no room.
     fn transition_plan(&self, mut plan: DropPlan, seconds: f32, row: i32) -> Option<DropPlan> {
-        let track = self.row_track(row).filter(|track| !self.locked(&track.id))?;
+        let track = self
+            .row_track(row)
+            .filter(|track| !self.locked(&track.id))?;
         let at = f64::from(seconds.max(0.0));
         let (cut, incoming) = self
             .picture_cuts(Some(&track.id))
@@ -3328,7 +3330,14 @@ impl Studio {
         let created = if plan.kind == ClipKind::Text {
             self.add_title(None, start, f64::from(plan.duration), &plan.media, None)
         } else if plan.kind == ClipKind::Shape {
-            self.add_shape(None, start, f64::from(plan.duration), &plan.media, &plan.label, None)
+            self.add_shape(
+                None,
+                start,
+                f64::from(plan.duration),
+                &plan.media,
+                &plan.label,
+                None,
+            )
         } else if plan.kind == ClipKind::Filter {
             let duration = f64::from(plan.duration);
             let lane = self.effect_lane(start, duration);
@@ -3636,7 +3645,10 @@ impl Studio {
     /// pictures: a cut a transition into it can dissolve across.
     fn visual_cut(&self, clip_id: &str) -> bool {
         self.clip(clip_id).is_some_and(|clip| {
-            clip.kind.is_visual() && self.outgoing_of(clip).is_some_and(|out| out.kind.is_visual())
+            clip.kind.is_visual()
+                && self
+                    .outgoing_of(clip)
+                    .is_some_and(|out| out.kind.is_visual())
         })
     }
 
@@ -3672,7 +3684,9 @@ impl Studio {
             .filter(|(cut, incoming)| {
                 under.iter().any(|clip| {
                     clip.id == *incoming
-                        || (self.clip(incoming).is_some_and(|next| next.track_id == clip.track_id)
+                        || (self
+                            .clip(incoming)
+                            .is_some_and(|next| next.track_id == clip.track_id)
                             && (clip.start + clip.duration - cut).abs() < frame / 2.0)
                 })
             })
@@ -4936,9 +4950,7 @@ impl Studio {
             let (w, h) = match shape.kind {
                 model::ShapeKind::Square | model::ShapeKind::Circle => (side, side),
                 model::ShapeKind::Triangle => (side, side * 0.866),
-                model::ShapeKind::Parallelogram | model::ShapeKind::Trapezoid => {
-                    (side, side * 0.6)
-                }
+                model::ShapeKind::Parallelogram | model::ShapeKind::Trapezoid => (side, side * 0.6),
                 model::ShapeKind::Line => (side, shape.stroke_width * height),
                 model::ShapeKind::Arrow => (side, (shape.stroke_width * 4.0).max(0.18) * side),
             };
