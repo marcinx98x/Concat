@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "单声道",
   "studio.mute": "静音",
+  "studio.noCutAtPlayhead": "当前位置没有相连的片段。无法添加转场。",
   "studio.noRoomForTransition": "这里没有放转场的空间：两个片段都至少需要一帧长",
   "studio.notAFont": "{0} 不是 Concat 能读取的字体",
   "studio.openProject": "打开项目…",

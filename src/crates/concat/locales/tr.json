@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "Sessiz",
+  "studio.noCutAtPlayhead": "Geçerli konumda bitişik klip yok. Geçiş eklenemedi.",
   "studio.noRoomForTransition": "Burada geçiş için yer yok: her iki klip de en az bir kare uzunluğunda olmalı",
   "studio.notAFont": "{0}, Concat’ın okuyabildiği bir yazı tipi değil",
   "studio.openProject": "Open project…",

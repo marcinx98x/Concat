@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "Silenciar",
+  "studio.noCutAtPlayhead": "No hay clips contiguos en la posición actual. No se pudo añadir la transición.",
   "studio.noRoomForTransition": "No hay espacio para una transición aquí: ambos clips deben durar al menos un fotograma",
   "studio.notAFont": "{0} no es una fuente que Concat pueda leer",
   "studio.openProject": "Open project…",

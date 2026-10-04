@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "음소거",
+  "studio.noCutAtPlayhead": "현재 위치에 이어진 클립이 없습니다. 전환을 추가할 수 없습니다.",
   "studio.noRoomForTransition": "여기에는 전환을 넣을 공간이 없습니다. 두 클립 모두 최소 한 프레임 이상이어야 합니다",
   "studio.notAFont": "{0}은(는) Concat이 읽을 수 있는 글꼴이 아닙니다",
   "studio.openProject": "Open project…",

@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "mono",
   "studio.mute": "Utišaj",
+  "studio.noCutAtPlayhead": "Na trenutnom položaju nema susjednih isječaka. Prijelaz nije moguće dodati.",
   "studio.noRoomForTransition": "Ovdje nema mjesta za prijelaz: oba isječka moraju trajati barem jednu sličicu",
   "studio.notAFont": "{0} nije font koji Concat može pročitati",
   "studio.openProject": "Open project…",

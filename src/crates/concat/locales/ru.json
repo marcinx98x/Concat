@@ -898,6 +898,7 @@
   "studio.lut": "LUT",
   "studio.mono": "моно",
   "studio.mute": "Без звука",
+  "studio.noCutAtPlayhead": "В текущей позиции нет смежных клипов. Не удалось добавить переход.",
   "studio.noRoomForTransition": "Здесь нет места для перехода: оба клипа должны длиться не меньше кадра",
   "studio.notAFont": "{0} — не шрифт, который Concat может прочитать",
   "studio.openProject": "Открыть проект…",
