@@ -1863,6 +1863,14 @@ fn retired_effects(project: &Project) -> Vec<String> {
     names
 }
 
+/// Names for a notice: the first three, and how many more there are.
+fn few(names: &[String]) -> String {
+    match names.len() {
+        0..=3 => names.join(", "),
+        count => format!("{} +{}", names[..3].join(", "), count - 3),
+    }
+}
+
 /// What the confirmation sheet can ask about.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Confirm {
@@ -6979,6 +6987,26 @@ impl Studio {
                     .unwrap_or_default();
                 if !upgraded.is_empty() {
                     self.notify(&tf("studio.upgradedEffects", &[&upgraded.join(", ")]), false);
+                }
+                // Clips that played backwards or moved by a preset in an
+                // earlier version, which this one does not read: named,
+                // with the way back where there is one.
+                let retired = self
+                    .session
+                    .as_ref()
+                    .map(|session| session.retired().clone())
+                    .unwrap_or_default();
+                if !retired.reversed.is_empty() {
+                    self.notify(
+                        &tf("studio.clipsNowForwards", &[&few(&retired.reversed)]),
+                        false,
+                    );
+                }
+                if !retired.animated.is_empty() {
+                    self.notify(
+                        &tf("studio.clipsLostAnimations", &[&few(&retired.animated)]),
+                        false,
+                    );
                 }
 
                 // Log missing media to file for debugging
