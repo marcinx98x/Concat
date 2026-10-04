@@ -3361,7 +3361,9 @@ impl Studio {
     /// None - the drop refused - off any cut, on a locked lane, or on a cut
     /// with no room.
     fn transition_plan(&self, mut plan: DropPlan, seconds: f32, row: i32) -> Option<DropPlan> {
-        let track = self.row_track(row).filter(|track| !self.locked(&track.id))?;
+        let track = self
+            .row_track(row)
+            .filter(|track| !self.locked(&track.id))?;
         let at = f64::from(seconds.max(0.0));
         let (cut, incoming) = self
             .picture_cuts(Some(&track.id))
@@ -3762,7 +3764,10 @@ impl Studio {
     /// pictures: a cut a transition into it can dissolve across.
     fn visual_cut(&self, clip_id: &str) -> bool {
         self.clip(clip_id).is_some_and(|clip| {
-            clip.kind.is_visual() && self.outgoing_of(clip).is_some_and(|out| out.kind.is_visual())
+            clip.kind.is_visual()
+                && self
+                    .outgoing_of(clip)
+                    .is_some_and(|out| out.kind.is_visual())
         })
     }
 
@@ -3798,7 +3803,9 @@ impl Studio {
             .filter(|(cut, incoming)| {
                 under.iter().any(|clip| {
                     clip.id == *incoming
-                        || (self.clip(incoming).is_some_and(|next| next.track_id == clip.track_id)
+                        || (self
+                            .clip(incoming)
+                            .is_some_and(|next| next.track_id == clip.track_id)
                             && (clip.start + clip.duration - cut).abs() < frame / 2.0)
                 })
             })

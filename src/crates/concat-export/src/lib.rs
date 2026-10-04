@@ -2069,7 +2069,11 @@ mod tests {
         assert_eq!(big, (4000, 2000), "never shrunk below the fitted size");
 
         let unknown = still_cover((1920, 1080), (1920, 1080));
-        assert_eq!(unknown, (1920, 1080), "a full-frame fallback is left as it was");
+        assert_eq!(
+            unknown,
+            (1920, 1080),
+            "a full-frame fallback is left as it was"
+        );
     }
 
     /// A treatment on track 1 runs over what track 0 drew and not over what
