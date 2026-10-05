@@ -68,6 +68,9 @@ export struct TrackData {
     /// is false on an empty lane, and `kind` then means nothing.
     typed: bool,
     kind: ClipKind,
+    /// Every clip on the lane is sound: there is no picture to hide, so
+    /// the header leaves the visibility switch's place empty.
+    sound-only: bool,
 }
 
 /// A media item's filmstrip and the window of it one clip shows.
@@ -152,6 +155,13 @@ export struct DropData {
     start: float,
     duration: float,
     row: int,
+    /// The drop opens a lane of its own rather than landing on `row`; the
+    /// lanes draw a line at `line-y`, down the stack, where it will open.
+    new-lane: bool,
+    line-y: length,
+    /// The line is for clips being moved on the timeline, not for a drag
+    /// from the library: `active` is false, and there is no ghost.
+    moving: bool,
 }
 
 /// Which axis the alignment segmented control is on. Mirrors TextAlign.

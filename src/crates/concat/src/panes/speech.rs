@@ -235,10 +235,7 @@ impl SpeechPane {
                         });
                         self.open = false;
                         if let Some(media_id) = media_id {
-                            studio.apply(Command::AddClipAtFirstFree {
-                                media_id,
-                                start: self.landing,
-                            });
+                            studio.place_media_at(&media_id, self.landing as f32);
                             studio.notify(&t("speech.voiceAddedTimeline"), false);
                         }
                     }

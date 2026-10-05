@@ -902,16 +902,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
                                       payload: SharedString,
                                       seconds: f32,
                                       y: f32| {
-        let row = state.row_at(y);
-        state.drop = state.plan(payload.as_str(), seconds, row);
+        state.drop = state.plan(payload.as_str(), seconds, y);
     }));
     editor.on_dropped(on_window!(|state,
                                   payload: SharedString,
                                   seconds: f32,
                                   y: f32| {
         state.drop = None;
-        let row = state.row_at(y);
-        if let Some(plan) = state.plan(payload.as_str(), seconds, row) {
+        if let Some(plan) = state.plan(payload.as_str(), seconds, y) {
             state.place(&plan);
         }
     }));

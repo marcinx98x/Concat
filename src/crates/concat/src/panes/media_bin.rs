@@ -192,9 +192,9 @@ impl MediaBin {
                     .filter(|item| self.selected.contains(&item.id))
                     .map(|item| item.id.clone())
                     .collect();
-                let start = f64::from(studio.playhead.max(0.0));
+                let start = studio.playhead;
                 for media_id in ids {
-                    studio.apply(Command::AddClipAtFirstFree { media_id, start });
+                    studio.place_media_at(&media_id, start);
                 }
             }
         }
