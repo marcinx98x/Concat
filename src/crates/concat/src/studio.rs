@@ -46,7 +46,7 @@ use concat_project::{Command, why_not_merge};
 use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::dock::{
-    Dock, DockLayout, SEAT_GAP, default_dock, lay_out, nearest_row, row_at, row_top,
+    Dock, DockLayout, SEAT_GAP, default_dock, lane_hit, lay_out, nearest_row, row_at, row_top,
 };
 use crate::format::{
     WAVE_BAR, WAVE_PITCH, colour_of, frames_timecode, hex_of, hex_rgba, hex_with_alpha,
@@ -96,6 +96,15 @@ const LANE_SMALL: f32 = 35.0;
 /// How long a title runs when it is placed: long enough to read, short
 /// enough that trimming it is a nudge rather than a fight.
 const LAYER_DURATION: f32 = 3.0;
+
+/// How long a still runs when it is placed: the engine's own default, so
+/// the ghost and the room a drop is checked for are the clip it makes.
+const STILL_DURATION: f32 = 5.0;
+
+/// How far in from a lane's top and bottom edge a drop still means that
+/// lane, in logical pixels. Nearer the edge it is the seam between two
+/// lanes, and the drop takes a lane of its own.
+const DROP_SEAM: f32 = 6.0;
 
 /// One media item's filmstrip, as the lanes tile it.
 pub struct Strip {
@@ -550,6 +559,32 @@ pub struct DropPlan {
     pub cut: Option<String>,
 }
 
+/// A file from the bin as a plan with no lane yet.
+fn media_plan(item: &model::MediaItem) -> DropPlan {
+    DropPlan {
+        kind: match item.kind {
+            model::MediaKind::Audio => ClipKind::Audio,
+            model::MediaKind::Image => ClipKind::Image,
+            model::MediaKind::Video => ClipKind::Video,
+        },
+        label: item.name.clone(),
+        media: item.id.clone(),
+        start: 0.0,
+        // A still has no length of its own; a file with no stated
+        // duration gets the engine's own fallback.
+        duration: if item.kind == model::MediaKind::Image {
+            STILL_DURATION
+        } else {
+            item.duration.unwrap_or(5.0) as f32
+        }
+        .max(MIN_DURATION),
+        row: 0,
+        new_lane: None,
+        transition: false,
+        cut: None,
+    }
+}
+
 /// `command` as is, or on a lane made for it at `new_lane`.
 fn on_new_track(new_lane: Option<usize>, command: Command) -> Command {
     match new_lane {
@@ -915,6 +950,9 @@ pub struct Studio {
     #[allow(clippy::type_complexity)]
     pub title_blocks: HashMap<String, ((u32, u32), (i32, i32))>,
     pub drop: Option<DropPlan>,
+    /// While clips are dragged and one of them would cover another: the
+    /// seam, down the stack, where the lane it will take opens.
+    move_seam: Option<f32>,
     pub project_sheet: crate::panes::project::ProjectPane,
     pub captions: crate::panes::captions::CaptionsPane,
     pub speech: crate::panes::speech::SpeechPane,
@@ -1330,6 +1368,25 @@ fn write_keyable(clip: &mut Clip, property: model::KeyProperty, value: f64, at: 
         model::KeyProperty::Opacity => clip.opacity = value,
         model::KeyProperty::Volume => clip.volume = value,
     }
+}
+
+/// The lanes, of `lanes`, that removing `doomed` leaves with nothing on
+/// them: lanes that had clips and lose every one. A lane already empty is
+/// not emptied by the removal. Never every lane: the first stays, since a
+/// project keeps at least one.
+fn lanes_emptied(lanes: &[&str], clips: &[(&str, &str)], doomed: &[String]) -> Vec<String> {
+    let mut emptied: Vec<String> = lanes
+        .iter()
+        .filter(|&&lane| {
+            let mut on_lane = clips.iter().filter(|(_, track)| *track == lane).peekable();
+            on_lane.peek().is_some() && on_lane.all(|(id, _)| doomed.iter().any(|d| d == id))
+        })
+        .map(|lane| (*lane).to_owned())
+        .collect();
+    if !emptied.is_empty() && emptied.len() >= lanes.len() {
+        emptied.remove(0);
+    }
+    emptied
 }
 
 /// A command as the activity trail names it: its kind, and for a batch
@@ -2013,6 +2070,7 @@ impl Studio {
             last_commit: None,
             title_blocks: HashMap::new(),
             drop: None,
+            move_seam: None,
             project_sheet: crate::panes::project::ProjectPane::default(),
             captions: crate::panes::captions::CaptionsPane::default(),
             speech: crate::panes::speech::SpeechPane::default(),
@@ -3244,28 +3302,7 @@ impl Studio {
         match sort {
             "media" => {
                 let item = self.media.by_row(self.project(), id.parse().ok()?)?;
-                Some(DropPlan {
-                    kind: match item.kind {
-                        model::MediaKind::Audio => ClipKind::Audio,
-                        model::MediaKind::Image => ClipKind::Image,
-                        model::MediaKind::Video => ClipKind::Video,
-                    },
-                    label: item.name.clone(),
-                    media: item.id.clone(),
-                    start: 0.0,
-                    // A still has no length of its own; a file with no stated
-                    // duration gets the engine's own fallback.
-                    duration: if item.kind == model::MediaKind::Image {
-                        LAYER_DURATION
-                    } else {
-                        item.duration.unwrap_or(5.0) as f32
-                    }
-                    .max(MIN_DURATION),
-                    row: 0,
-                    new_lane: None,
-                    transition: false,
-                    cut: None,
-                })
+                Some(media_plan(item))
             }
             // A title: the preset's id rides where a file's media id would,
             // "default" for the plain one.
@@ -3324,39 +3361,37 @@ impl Studio {
         }
     }
 
-    /// A drag over the lanes: the pointer names the moment and the lane.
-    pub fn plan(&self, payload: &str, seconds: f32, row: i32) -> Option<DropPlan> {
+    /// A drag over the lanes: the pointer names the moment, `y` the point
+    /// down the stack it is over.
+    pub fn plan(&self, payload: &str, seconds: f32, y: f32) -> Option<DropPlan> {
         let mut plan = self.incoming(payload)?;
         let lanes = self.timeline().tracks.len() as i32;
         if lanes == 0 {
             return None;
         }
         if plan.transition {
-            return self.transition_plan(plan, seconds, row.clamp(0, lanes - 1));
-        }
-        // The lane under the pointer when the clip belongs there, else the
-        // nearest one in its band of the stack, else a new lane at the
-        // band's edge.
-        let groups = self.lane_groups(&[]);
-        let group = zones::Group::of_ui(plan.kind);
-        match zones::nearest(&groups, row.clamp(0, lanes - 1), group) {
-            Some(found) => plan.row = found,
-            None => {
-                let index = zones::new_lane_index(&groups, group);
-                plan.new_lane = Some(index);
-                plan.row = (lanes - index as i32).clamp(0, lanes - 1);
-            }
-        }
-        if plan.new_lane.is_none()
-            && self
-                .row_track(plan.row)
-                .is_none_or(|track| self.locked(&track.id))
-        {
-            return None;
+            return self.transition_plan(plan, seconds, self.row_at(y));
         }
         plan.start = self
             .snapped(seconds.max(0.0), 8.0 * self.lanes.seconds_per_pixel, "")
             .max(0.0);
+        // The lane under the pointer when the clip belongs there and fits in
+        // the room it is let go over; else a new lane at its kind's edge.
+        let heights = self.lane_heights();
+        let row = lane_hit(&heights, y, DROP_SEAM);
+        let (from, to) = (f64::from(plan.start), f64::from(plan.start + plan.duration));
+        let fits = row
+            .and_then(|row| self.row_track(row))
+            .is_some_and(|track| !self.locked(&track.id) && !self.covers(&track.id, from, to, &[]));
+        let groups = self.lane_groups(&[]);
+        let group = zones::Group::of_ui(plan.kind);
+        match zones::drop_landing(&groups, row, fits, group) {
+            zones::Landing::Row(row) => plan.row = row,
+            zones::Landing::NewLane(index) => {
+                plan.new_lane = Some(index);
+                plan.row = (lanes - index as i32).clamp(0, lanes - 1);
+            }
+        }
         Some(plan)
     }
 
@@ -3435,7 +3470,9 @@ impl Studio {
                     media_id: plan.media.clone(),
                     track_id,
                     start: f64::from(plan.start),
-                    ripple: true,
+                    // A plan only names a lane the clip fits on, or a new
+                    // one: nothing already placed is pushed along.
+                    ripple: false,
                 },
             ))
         };
@@ -3444,67 +3481,50 @@ impl Studio {
         }
     }
 
-    /// A card clicked rather than dragged: the playhead names the moment
-    /// and the engine finds a lane with room.
+    /// A card clicked rather than dragged: the playhead names the moment,
+    /// and the clip lands where [`zones::landing`] says.
     pub fn place_at_playhead(&mut self, payload: &str) {
         let Some(plan) = self.incoming(payload).filter(|plan| !plan.transition) else {
             return;
         };
-        let start = f64::from(self.playhead.max(0.0));
-        let created = if plan.kind == ClipKind::Text {
-            self.add_title(None, start, f64::from(plan.duration), &plan.media, None)
-        } else if plan.kind == ClipKind::Shape {
-            self.add_shape(
-                None,
-                start,
-                f64::from(plan.duration),
-                &plan.media,
-                &plan.label,
-                None,
-            )
-        } else if plan.kind == ClipKind::Filter {
-            let duration = f64::from(plan.duration);
-            let lane = self.effect_lane(start, duration);
-            let new_lane = lane.is_none().then(|| self.timeline().tracks.len());
-            self.apply(on_new_track(
-                new_lane,
-                Command::AddLayerClip {
-                    track_id: lane,
-                    start,
-                    duration: Some(duration),
-                    effect_id: plan.media.clone(),
-                    name: plan.label.clone(),
-                },
-            ))
-        } else {
-            self.apply(Command::AddClipAtFirstFree {
-                media_id: plan.media.clone(),
-                start,
-            })
-        };
-        if let Some(id) = created {
-            self.selection = vec![id];
-        }
+        self.land(plan, self.playhead.max(0.0));
     }
 
-    /// The lane a look laid at the playhead goes on: the one nearest the
-    /// video among those in the looks' band of the stack, unlocked and with
-    /// nothing in `[start, start + duration)`. None when there is none, and
-    /// a new lane at the top is wanted.
-    fn effect_lane(&self, start: f64, duration: f64) -> Option<String> {
+    /// A file from the bin laid at `start` without a drop: the bin's Add at
+    /// playhead, a voice read aloud.
+    pub fn place_media_at(&mut self, media_id: &str, start: f32) {
+        let Some(item) = self.project().media_by_id(media_id) else {
+            return;
+        };
+        let plan = media_plan(item);
+        self.land(plan, start.max(0.0));
+    }
+
+    /// Lays `plan` at `start` on a lane of its kind with room over its span,
+    /// or on a new lane at its kind's edge of the stack.
+    fn land(&mut self, mut plan: DropPlan, start: f32) {
+        let lanes = self.timeline().tracks.len() as i32;
+        if lanes == 0 {
+            return;
+        }
+        plan.start = start;
+        let (from, to) = (f64::from(start), f64::from(start + plan.duration));
+        let free: Vec<bool> = (0..lanes)
+            .map(|row| {
+                self.row_track(row).is_some_and(|track| {
+                    !self.locked(&track.id) && !self.covers(&track.id, from, to, &[])
+                })
+            })
+            .collect();
         let groups = self.lane_groups(&[]);
-        let end = start + duration;
-        let timeline = self.timeline();
-        (0..groups.len() as i32).rev().find_map(|row| {
-            if !zones::valid_row(&groups, row, zones::Group::Effect) {
-                return None;
+        match zones::landing(&groups, &free, zones::Group::of_ui(plan.kind)) {
+            zones::Landing::Row(row) => plan.row = row,
+            zones::Landing::NewLane(index) => {
+                plan.new_lane = Some(index);
+                plan.row = (lanes - index as i32).clamp(0, lanes - 1);
             }
-            let track = self.row_track(row)?;
-            let busy = timeline.clips.iter().any(|clip| {
-                clip.track_id == track.id && clip.start < end && start < clip.start + clip.duration
-            });
-            (!busy && !self.locked(&track.id)).then(|| track.id.clone())
-        })
+        }
+        self.place(&plan);
     }
 
     /// Places a title in the look a preset names - "default" for the plain
@@ -4333,31 +4353,14 @@ impl Studio {
             };
             return;
         }
-        let mut moving = if self.selection.iter().any(|held| held == id) {
+        // The clip pressed, or the selection it is part of - nothing else:
+        // a detached sound moves without its picture unless both are
+        // selected.
+        let moving = if self.selection.iter().any(|held| held == id) {
             self.selection.clone()
         } else {
             vec![id.to_owned()]
         };
-        // A detached sound travels with its picture and the picture with
-        // its sound: the pair stays in step unless one of them is moved
-        // on its own lane by a lock (#105).
-        let partners: Vec<String> = moving
-            .iter()
-            .filter_map(|clip_id| self.clip(clip_id))
-            .flat_map(|clip| {
-                let mut found: Vec<String> = clip.detached_from.iter().cloned().collect();
-                found.extend(
-                    self.timeline()
-                        .clips
-                        .iter()
-                        .filter(|other| other.detached_from.as_deref() == Some(clip.id.as_str()))
-                        .map(|other| other.id.clone()),
-                );
-                found
-            })
-            .filter(|partner| !moving.contains(partner))
-            .collect();
-        moving.extend(partners);
         let origins = moving
             .iter()
             .filter_map(|clip_id| {
@@ -4425,6 +4428,8 @@ impl Studio {
                         }
                     }
                 }
+                let (_, fresh) = self.move_split(self.echoed_moves(origins));
+                self.move_seam = fresh.first().map(|(index, _)| self.seam_of(*index));
             }
             Gesture::Trim {
                 clip,
@@ -4437,12 +4442,18 @@ impl Studio {
                 let (start, duration, source_start) = (*start, *duration, *source_start);
                 let threshold = 8.0 * self.lanes.seconds_per_pixel;
                 let speed = self.clip(&id).map_or(1.0, |clip| clip.speed as f32);
+                // The neighbours on its lane: an edge stops where the clip
+                // before ends and the one after starts, never covering them.
+                let (before, after) = self.lane_neighbours(&id, start, start + duration);
                 if edge == Edge::Start {
                     // The head cannot pass the tail, and cannot pull material
                     // out of a file that has none before the in-point.
                     let wanted = self.snapped(start + seconds, threshold, &id);
                     let limit = start + duration - MIN_DURATION;
-                    let at = wanted.clamp((start - source_start / speed.max(0.01)).max(0.0), limit);
+                    let floor = (start - source_start / speed.max(0.01))
+                        .max(0.0)
+                        .max(before);
+                    let at = wanted.clamp(floor.min(limit), limit);
                     let delta = at - start;
                     if let Some(clip) = self.echo_clip_mut(&id) {
                         clip.start = f64::from(at);
@@ -4455,7 +4466,11 @@ impl Studio {
                     }
                 } else {
                     let wanted = self.snapped(start + duration + seconds, threshold, &id);
-                    let at = wanted.max(start + MIN_DURATION);
+                    let mut at = wanted.max(start + MIN_DURATION);
+                    // Magnetic, the clips after move along with the tail.
+                    if !self.prefs.magnetic {
+                        at = at.min(after.max(start + MIN_DURATION));
+                    }
                     if let Some(clip) = self.echo_clip_mut(&id) {
                         clip.duration = f64::from(at - start);
                     }
@@ -4500,29 +4515,137 @@ impl Studio {
         self.gesture = gesture;
     }
 
+    /// Moved clips split by whether they land clear: the moves that cover
+    /// nothing left where it was, and, for the ones that would, the new
+    /// lanes they take at their kind's edge - each as the index it goes in
+    /// at and the moves onto it.
+    fn move_split(&self, moves: Vec<ClipMove>) -> (Vec<ClipMove>, Vec<(usize, Vec<ClipMove>)>) {
+        let timeline = self.timeline();
+        let ids: Vec<String> = moves.iter().map(|wanted| wanted.clip_id.clone()).collect();
+        let moving: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut groups = self.lane_groups(&moving);
+        let (mut clear, mut clashing) = (Vec::new(), Vec::new());
+        for wanted in moves {
+            let Some(clip) = timeline.clip(&wanted.clip_id) else {
+                continue;
+            };
+            let (start, end) = (wanted.start, wanted.start + clip.duration);
+            let group = zones::Group::of_model(clip.kind);
+            if self.covers(&wanted.track_id, start, end, &moving) {
+                clashing.push((wanted, (group, start, end)));
+            } else {
+                let row = usize::try_from(self.row_of(&wanted.track_id)).ok();
+                if let Some(held @ None) = row.and_then(|at| groups.get_mut(at)) {
+                    *held = Some(group);
+                }
+                clear.push(wanted);
+            }
+        }
+        let spans: Vec<_> = clashing.iter().map(|(_, span)| *span).collect();
+        let (of_clip, indices) = zones::fresh_lanes(&groups, &spans);
+        let mut fresh: Vec<(usize, Vec<ClipMove>)> = indices
+            .into_iter()
+            .map(|index| (index, Vec::new()))
+            .collect();
+        for ((wanted, _), lane) in clashing.into_iter().zip(of_clip) {
+            fresh[lane].1.push(wanted);
+        }
+        (clear, fresh)
+    }
+
+    /// Where the clip before `id` on its lane ends and the one after it
+    /// starts, around the span `[start, end)` the clip had when the trim
+    /// began: 0 and infinity when there is none.
+    fn lane_neighbours(&self, id: &str, start: f32, end: f32) -> (f32, f32) {
+        let Some(track) = self.clip(id).map(|clip| clip.track_id.clone()) else {
+            return (0.0, f32::INFINITY);
+        };
+        let slack = self.frame_seconds() / 2.0;
+        let (start, end) = (f64::from(start), f64::from(end));
+        self.timeline()
+            .clips
+            .iter()
+            .filter(|other| other.id != id && other.track_id == track)
+            .fold((0.0, f32::INFINITY), |(before, after), other| {
+                let other_end = other.start + other.duration;
+                if other_end <= start + slack {
+                    (before.max(other_end as f32), after)
+                } else if other.start >= end - slack {
+                    (before, after.min(other.start as f32))
+                } else {
+                    (before, after)
+                }
+            })
+    }
+
+    /// Whether `[start, end)` on `track` overlaps a clip not in `skip`, by
+    /// more than half a frame - what touching clips round to.
+    fn covers(&self, track: &str, start: f64, end: f64, skip: &[&str]) -> bool {
+        let slack = self.frame_seconds() / 2.0;
+        self.timeline().clips.iter().any(|other| {
+            other.track_id == track
+                && !skip.contains(&other.id.as_str())
+                && other.start < end - slack
+                && start < other.start + other.duration - slack
+        })
+    }
+
+    /// The seam, down the stack, a new lane inserted at `index` of the
+    /// bottom-first tracks opens at: over row `count - index`.
+    fn seam_of(&self, index: usize) -> f32 {
+        let heights = self.lane_heights();
+        row_top(&heights, heights.len() as i32 - index as i32)
+    }
+
+    /// The moves the echo holds for the clips being dragged.
+    fn echoed_moves(&self, origins: &[MoveOrigin]) -> Vec<ClipMove> {
+        let Some(echo) = self.echo.as_ref() else {
+            return Vec::new();
+        };
+        origins
+            .iter()
+            .filter_map(|origin| {
+                let after = echo.active().clip(&origin.clip)?;
+                Some(ClipMove {
+                    clip_id: origin.clip.clone(),
+                    start: after.start,
+                    track_id: after.track_id.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// The pointer let go: the whole gesture becomes one command.
     pub fn clip_released(&mut self) {
+        self.move_seam = None;
         let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
         let Some(echo) = self.echo.as_ref() else {
             return;
         };
         match gesture {
             Gesture::Move { origins, .. } => {
-                let moves: Vec<ClipMove> = origins
-                    .iter()
-                    .filter_map(|origin| {
-                        let after = echo.active().clip(&origin.clip)?;
-                        Some(ClipMove {
-                            clip_id: origin.clip.clone(),
-                            start: after.start,
-                            track_id: after.track_id.clone(),
-                        })
-                    })
-                    .collect();
+                let moves = self.echoed_moves(&origins);
                 self.echo = None;
-                if !moves.is_empty() {
-                    self.apply(Command::MoveClips { moves });
+                if moves.is_empty() {
+                    return;
                 }
+                // A clip that would cover another goes to a lane of its own,
+                // at its kind's edge and at the same moment, in the same
+                // undo step as the rest of the move.
+                let (clear, fresh) = self.move_split(moves);
+                if fresh.is_empty() {
+                    self.apply(Command::MoveClips { moves: clear });
+                    return;
+                }
+                let mut commands = Vec::new();
+                if !clear.is_empty() {
+                    commands.push(Command::MoveClips { moves: clear });
+                }
+                commands.extend(fresh.into_iter().map(|(index, moves)| Command::OnNewTrack {
+                    index,
+                    command: Box::new(Command::MoveClips { moves }),
+                }));
+                self.apply(Command::Batch { commands });
             }
             Gesture::Trim {
                 clip,
@@ -6688,12 +6811,39 @@ impl Studio {
             .cloned()
             .collect();
         if !doomed.is_empty() {
-            self.apply(Command::RemoveClips {
-                clip_ids: doomed,
-                ripple,
-            });
+            self.remove_clips(doomed, ripple);
         }
         self.selection.clear();
+    }
+
+    /// Removes the clips, and with them every lane they leave with nothing
+    /// on it, as one undo step: a lane emptied by a delete is not one the
+    /// user meant to keep. The project keeps at least one lane.
+    fn remove_clips(&mut self, clip_ids: Vec<String>, ripple: bool) {
+        let timeline = self.timeline();
+        let lanes: Vec<&str> = timeline
+            .tracks
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect();
+        let clips: Vec<(&str, &str)> = timeline
+            .clips
+            .iter()
+            .map(|clip| (clip.id.as_str(), clip.track_id.as_str()))
+            .collect();
+        let emptied = lanes_emptied(&lanes, &clips, &clip_ids);
+        let remove = Command::RemoveClips { clip_ids, ripple };
+        if emptied.is_empty() {
+            self.apply(remove);
+            return;
+        }
+        let mut commands = vec![remove];
+        commands.extend(
+            emptied
+                .into_iter()
+                .map(|track_id| Command::RemoveTrack { track_id }),
+        );
+        self.apply(Command::Batch { commands });
     }
 
     pub fn merge_blocked(&self) -> Option<String> {
@@ -7660,10 +7810,17 @@ impl Studio {
                 .rev()
                 .map(|lane| {
                     let height = self.lane_height(lane);
-                    let first = timeline.clips.iter().find(|clip| clip.track_id == lane.id);
+                    let mut on_lane = timeline
+                        .clips
+                        .iter()
+                        .filter(|clip| clip.track_id == lane.id)
+                        .peekable();
+                    let first = on_lane.peek().copied();
                     let row = TrackData {
                         typed: first.is_some(),
                         kind: first.map_or(ClipKind::Video, |clip| kind_of(clip)),
+                        sound_only: first.is_some()
+                            && on_lane.all(|clip| kind_of(clip) == ClipKind::Audio),
                         id: lane.id.as_str().into(),
                         visible: lane.visible,
                         muted: lane.muted,
@@ -7777,8 +7934,19 @@ impl Studio {
                 start: plan.start,
                 duration: plan.duration,
                 row: plan.row,
+                new_lane: plan.new_lane.is_some(),
+                line_y: plan.new_lane.map_or(0.0, |index| self.seam_of(index)),
+                moving: false,
             },
-            None => DropData::default(),
+            None => match self.move_seam {
+                Some(line_y) if matches!(self.gesture, Gesture::Move { .. }) => DropData {
+                    new_lane: true,
+                    moving: true,
+                    line_y,
+                    ..DropData::default()
+                },
+                _ => DropData::default(),
+            },
         });
 
         editor.set_selected_clip(self.selected());
@@ -10213,10 +10381,7 @@ impl Studio {
                 if self.selection.len() > 1 && self.selection.iter().any(|held| held == id) {
                     self.remove_selected(ripple);
                 } else {
-                    self.apply(Command::RemoveClips {
-                        clip_ids: vec![id.to_owned()],
-                        ripple,
-                    });
+                    self.remove_clips(vec![id.to_owned()], ripple);
                 }
                 self.menu_target = None;
             }
@@ -10262,9 +10427,36 @@ impl Studio {
 mod tests {
     use super::{
         Command, Footprint, Studio, adjust_key_names, chain_colours, chain_rows, custom_frame,
-        custom_rate, fps_of, grading_rows, home_folder, key_commands, packed, place_in, shown,
-        wheel_partners, write_keyable,
+        custom_rate, fps_of, grading_rows, home_folder, key_commands, lanes_emptied, packed,
+        place_in, shown, wheel_partners, write_keyable,
     };
+
+    /// A lane the delete takes every clip off goes with them; a lane that
+    /// keeps a clip, or was empty to begin with, stays; and the last lane
+    /// of the project stays whatever happens to it.
+    #[test]
+    fn a_delete_takes_the_lanes_it_empties() {
+        let doomed =
+            |ids: &[&str]| -> Vec<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+        let lanes = ["t1", "t2", "t3"];
+        let clips = [("a", "t1"), ("b", "t2"), ("c", "t2")];
+        assert_eq!(lanes_emptied(&lanes, &clips, &doomed(&["a"])), ["t1"]);
+        assert!(
+            lanes_emptied(&lanes, &clips, &doomed(&["b"])).is_empty(),
+            "t2 keeps c"
+        );
+        assert_eq!(
+            lanes_emptied(&lanes, &clips, &doomed(&["a", "b", "c"])),
+            ["t1", "t2"]
+        );
+        assert!(lanes_emptied(&lanes, &clips, &doomed(&[])).is_empty());
+        let both = [("a", "t1"), ("b", "t2")];
+        assert_eq!(
+            lanes_emptied(&["t1", "t2"], &both, &doomed(&["a", "b"])),
+            ["t2"]
+        );
+        assert!(lanes_emptied(&["t1"], &[("a", "t1")], &doomed(&["a"])).is_empty());
+    }
 
     /// A wheel is keyed as one knob: named by itself or by any of its own
     /// keys, it keys its puck and master; its master's key takes the puck's

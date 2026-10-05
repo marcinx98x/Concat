@@ -96,16 +96,6 @@ pub fn toward(groups: &[Option<Group>], target: i32, origin: i32, group: Group) 
     origin
 }
 
-/// The allowed row nearest `target`, either way; None when there is none.
-pub fn nearest(groups: &[Option<Group>], target: i32, group: Group) -> Option<i32> {
-    let count = groups.len() as i32;
-    (0..count).find_map(|distance| {
-        [target - distance, target + distance]
-            .into_iter()
-            .find(|row| valid_row(groups, *row, group))
-    })
-}
-
 /// Where a new lane for `group` goes when no row allows it, as an index
 /// into the model's bottom-first tracks: sound at the very bottom, graphics
 /// and looks at the very top, video just over the top-most video lane - or
@@ -127,10 +117,234 @@ pub fn new_lane_index(groups: &[Option<Group>], group: Group) -> usize {
     }
 }
 
+/// Where something added without a drop lands: on a lane, by row, or on a
+/// new lane, by index into the model's bottom-first tracks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    Row(i32),
+    NewLane(usize),
+}
+
+/// Where a clip added at the playhead goes, given what every row holds
+/// and which rows are `free` - unlocked, with room over the clip's span.
+///
+/// A lane of its own group first, then an empty lane where its group
+/// belongs; pictures over the video take the one nearest the video, video
+/// and sound the top-most. With no room on any, a new lane: over
+/// everything for pictures and looks, under the bottom-most video lane for
+/// video, under everything for sound - so a second video stacks under the
+/// first and a second sound under the sound, and the user drags it to
+/// another lane of its kind if that is where it belongs.
+pub fn landing(groups: &[Option<Group>], free: &[bool], group: Group) -> Landing {
+    let over_video = matches!(group, Group::Graphic | Group::Effect);
+    let last_held = groups.iter().rposition(|held| *held == Some(group));
+    let preference = |row: i32| {
+        let at = row as usize;
+        if groups[at] == Some(group) {
+            0
+        } else if over_video || last_held.is_none_or(|last| at > last) {
+            1
+        } else {
+            2
+        }
+    };
+    let candidates = (0..groups.len() as i32).filter(|&row| {
+        free.get(row as usize).copied().unwrap_or(false) && valid_row(groups, row, group)
+    });
+    let best = if over_video {
+        candidates.min_by_key(|&row| (preference(row), -row))
+    } else {
+        candidates.min_by_key(|&row| (preference(row), row))
+    };
+    best.map_or_else(
+        || Landing::NewLane(added_lane_index(groups, group)),
+        Landing::Row,
+    )
+}
+
+/// Where a clip dropped from the library goes: onto `row`, the lane under
+/// the pointer, when there is one, its group may sit there and `row_free`
+/// says the clip fits in the room the pointer is over. Anywhere else -
+/// between lanes, off the stack, over another kind's lane, over clips it
+/// would cover - on a new lane at its group's edge, at the same moment, so
+/// a drop never pushes what is already on a lane along it.
+pub fn drop_landing(
+    groups: &[Option<Group>],
+    row: Option<i32>,
+    row_free: bool,
+    group: Group,
+) -> Landing {
+    match row {
+        Some(row) if row_free && valid_row(groups, row, group) => Landing::Row(row),
+        _ => Landing::NewLane(added_lane_index(groups, group)),
+    }
+}
+
+/// The new lanes moved clips that would cover others take, each clip
+/// given as its group and span. Clips of a group share a lane while they
+/// do not overlap one another; past that the group takes another. Returns
+/// the new lane of each clip, counted in the order they are made, and the
+/// index each is inserted at - worked out against the stack as every
+/// earlier one has already gone in, which is the order they are applied.
+pub fn fresh_lanes(
+    groups: &[Option<Group>],
+    clashing: &[(Group, f64, f64)],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut stack = groups.to_vec();
+    /// A lane being made: its group, the spans on it, where it goes in.
+    type Fresh = (Group, Vec<(f64, f64)>, usize);
+    let mut lanes: Vec<Fresh> = Vec::new();
+    let mut of_clip = Vec::with_capacity(clashing.len());
+    for &(group, start, end) in clashing {
+        let shared = lanes.iter().position(|(held, spans, _)| {
+            *held == group && spans.iter().all(|&(from, to)| end <= from || to <= start)
+        });
+        let lane = shared.unwrap_or_else(|| {
+            let index = added_lane_index(&stack, group);
+            stack.insert(stack.len() - index, Some(group));
+            lanes.push((group, Vec::new(), index));
+            lanes.len() - 1
+        });
+        lanes[lane].1.push((start, end));
+        of_clip.push(lane);
+    }
+    (
+        of_clip,
+        lanes.into_iter().map(|(_, _, index)| index).collect(),
+    )
+}
+
+/// [`new_lane_index`], but video goes under the bottom-most video lane
+/// rather than over the top-most: a clip added stacks under what is there.
+pub fn added_lane_index(groups: &[Option<Group>], group: Group) -> usize {
+    let count = groups.len();
+    match group {
+        Group::Video => groups
+            .iter()
+            .rposition(|held| *held == Some(Group::Video))
+            .map_or_else(|| new_lane_index(groups, group), |row| count - 1 - row),
+        _ => new_lane_index(groups, group),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use Group::*;
+
+    /// Room on a lane of its own kind is taken; with none, a new lane at
+    /// the kind's edge: pictures on top, video under the video, sound at
+    /// the foot.
+    #[test]
+    fn an_added_clip_takes_room_in_its_kind_or_a_new_lane_at_its_edge() {
+        let groups = vec![Some(Graphic), Some(Video), Some(Video), Some(Audio)];
+        let all = [true; 4];
+        let none = [false; 4];
+        assert_eq!(landing(&groups, &all, Video), Landing::Row(1));
+        assert_eq!(
+            landing(&groups, &[true, false, true, true], Video),
+            Landing::Row(2)
+        );
+        assert_eq!(landing(&groups, &all, Audio), Landing::Row(3));
+        assert_eq!(landing(&groups, &all, Graphic), Landing::Row(0));
+        // Rows 0..3 top-first are track indices 3..0: under the bottom-most
+        // video (row 2, index 1) is index 1.
+        assert_eq!(landing(&groups, &none, Video), Landing::NewLane(1));
+        assert_eq!(landing(&groups, &none, Audio), Landing::NewLane(0));
+        assert_eq!(landing(&groups, &none, Graphic), Landing::NewLane(4));
+        assert_eq!(landing(&groups, &none, Effect), Landing::NewLane(4));
+    }
+
+    /// A graphic, video and three sound lanes, top to bottom: a drop that
+    /// does not fit where it is let go lands on a new lane at its kind's
+    /// edge - a graphic over everything, video under the video, sound
+    /// under the third sound lane - and one that fits stays put.
+    #[test]
+    fn a_drop_lands_where_its_kind_belongs_unless_it_fits_where_let_go() {
+        let groups = vec![
+            Some(Graphic),
+            Some(Video),
+            Some(Audio),
+            Some(Audio),
+            Some(Audio),
+        ];
+        assert_eq!(
+            drop_landing(&groups, Some(4), true, Graphic),
+            Landing::NewLane(5),
+            "a graphic over sound goes to the top"
+        );
+        assert_eq!(
+            drop_landing(&groups, Some(0), false, Graphic),
+            Landing::NewLane(5)
+        );
+        assert_eq!(
+            drop_landing(&groups, Some(0), true, Graphic),
+            Landing::Row(0)
+        );
+        // Row 1 is track index 3: a new lane under it is index 3.
+        assert_eq!(
+            drop_landing(&groups, Some(1), false, Video),
+            Landing::NewLane(3)
+        );
+        assert_eq!(
+            drop_landing(&groups, None, true, Video),
+            Landing::NewLane(3)
+        );
+        assert_eq!(
+            drop_landing(&groups, Some(3), true, Video),
+            Landing::NewLane(3)
+        );
+        assert_eq!(drop_landing(&groups, Some(1), true, Video), Landing::Row(1));
+        assert_eq!(
+            drop_landing(&groups, Some(2), false, Audio),
+            Landing::NewLane(0)
+        );
+        assert_eq!(
+            drop_landing(&groups, Some(0), true, Audio),
+            Landing::NewLane(0)
+        );
+        assert_eq!(drop_landing(&groups, Some(3), true, Audio), Landing::Row(3));
+    }
+
+    /// Moved clips that would cover others: two videos over each other take
+    /// a lane each, stacked under the video; the sound one goes under
+    /// everything; two videos clear of each other share a lane.
+    #[test]
+    fn moved_clips_that_clash_take_new_lanes_at_their_kinds_edge() {
+        let groups = vec![Some(Graphic), Some(Video), Some(Audio)];
+        let (of_clip, indices) = fresh_lanes(
+            &groups,
+            &[(Video, 0.0, 5.0), (Video, 2.0, 6.0), (Audio, 0.0, 5.0)],
+        );
+        assert_eq!(of_clip, [0, 1, 2]);
+        assert_eq!(indices, [1, 1, 0]);
+        let (of_clip, indices) = fresh_lanes(&groups, &[(Video, 0.0, 2.0), (Video, 3.0, 5.0)]);
+        assert_eq!(of_clip, [0, 0]);
+        assert_eq!(indices, [1]);
+        let (of_clip, indices) = fresh_lanes(&groups, &[(Graphic, 0.0, 2.0), (Graphic, 1.0, 3.0)]);
+        assert_eq!(of_clip, [0, 1]);
+        assert_eq!(indices, [3, 4]);
+    }
+
+    /// An empty lane where the kind belongs is used before a new one is
+    /// made; one on the wrong side of the video is not.
+    #[test]
+    fn an_added_clip_takes_an_empty_lane_where_its_kind_belongs() {
+        let fresh = vec![None];
+        assert_eq!(landing(&fresh, &[true], Video), Landing::Row(0));
+        assert_eq!(landing(&fresh, &[true], Audio), Landing::Row(0));
+        // Video busy: the empty lane under it, not the one over it.
+        let groups = vec![None, Some(Video), None, Some(Audio)];
+        let free = [true, false, true, false];
+        assert_eq!(landing(&groups, &free, Video), Landing::Row(2));
+        assert_eq!(landing(&groups, &free, Graphic), Landing::Row(0));
+        assert_eq!(landing(&groups, &free, Audio), Landing::Row(2));
+        // A locked or busy empty lane is no room at all.
+        assert_eq!(
+            landing(&[Some(Video), None], &[false, false], Audio),
+            Landing::NewLane(0)
+        );
+    }
 
     /// Top to bottom: a graphic, an empty lane, video, sound, an empty lane.
     fn stack() -> Vec<Option<Group>> {
@@ -166,7 +380,6 @@ mod tests {
         let groups = stack();
         assert!(!valid_row(&groups, 0, Effect));
         assert!(valid_row(&groups, 1, Effect));
-        assert_eq!(nearest(&groups, 0, Effect), Some(1));
     }
 
     #[test]
@@ -180,9 +393,7 @@ mod tests {
     #[test]
     fn a_drop_with_nowhere_to_go_says_so_and_where_a_lane_belongs() {
         let groups = vec![Some(Graphic), Some(Video)];
-        assert_eq!(nearest(&groups, 0, Audio), None);
         assert_eq!(new_lane_index(&groups, Audio), 0, "under everything");
-        assert_eq!(nearest(&groups, 1, Effect), None);
         assert_eq!(new_lane_index(&groups, Effect), 2, "over everything");
         // Video goes just over the top-most video lane: row 1 is track
         // index 0, so the new lane is index 1, under the graphic.

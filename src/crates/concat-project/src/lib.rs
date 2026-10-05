@@ -479,6 +479,42 @@ mod tests {
         assert!(editor.project().active().clips.is_empty());
     }
 
+    /// A moved clip that would cover another takes a lane of its own: the
+    /// lane and the move are one edit, and one undo puts both back.
+    #[test]
+    fn clips_moved_onto_a_new_lane_land_there_in_one_undo_step() {
+        let (mut editor, media_id, first) = fixture();
+        let video = editor.project().active().tracks[0].id.clone();
+        let rest = lane(&mut editor, &media_id, &video, &[10.0]);
+        let lanes = editor.project().active().tracks.len();
+        editor
+            .apply(Command::OnNewTrack {
+                index: 0,
+                command: Box::new(Command::MoveClips {
+                    moves: vec![ClipMove {
+                        clip_id: rest[0].clone(),
+                        start: 4.0,
+                        track_id: video.clone(),
+                    }],
+                }),
+            })
+            .expect("moves");
+        let timeline = editor.project().active();
+        assert_eq!(timeline.tracks.len(), lanes + 1);
+        let fresh = timeline.tracks[0].id.clone();
+        let moved = timeline.clip(&rest[0]).expect("exists");
+        assert_eq!(
+            (moved.start, moved.track_id.as_str()),
+            (4.0, fresh.as_str())
+        );
+        assert_eq!(timeline.clip(&first).expect("exists").track_id, video);
+        assert!(editor.undo());
+        let timeline = editor.project().active();
+        assert_eq!(timeline.tracks.len(), lanes);
+        let back = timeline.clip(&rest[0]).expect("exists");
+        assert_eq!((back.start, back.track_id.as_str()), (10.0, video.as_str()));
+    }
+
     #[test]
     fn a_remove_clips_document_without_the_ripple_field_still_parses_as_a_plain_delete() {
         let command: Command = serde_json::from_value(json!({

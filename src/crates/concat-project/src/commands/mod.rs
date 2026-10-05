@@ -622,7 +622,10 @@ pub enum Command {
     /// the stack when no existing lane there will take it. The inner
     /// command must place a clip ([`Command::AddClip`],
     /// [`Command::AddTextClip`], [`Command::AddShapeClip`] or
-    /// [`Command::AddLayerClip`]); its own track is replaced by the new one.
+    /// [`Command::AddLayerClip`]) or move clips ([`Command::MoveClips`],
+    /// every one of them onto the new lane, as a moved clip that would
+    /// cover another takes a lane of its own); its own track is replaced
+    /// by the new one.
     OnNewTrack {
         /// Where the lane goes: 0 is the bottom, the track count the top.
         index: usize,

@@ -308,6 +308,22 @@ pub fn row_at(heights: &[f32], y: f32) -> i32 {
     (heights.len() as i32 - 1).max(0)
 }
 
+/// The row a point down the stack is inside, clear of its top and bottom
+/// `edge`: None off the stack and in the seam between two lanes, which is
+/// where a drop means a lane of its own rather than this one.
+pub fn lane_hit(heights: &[f32], y: f32, edge: f32) -> Option<i32> {
+    let mut top = 0.0;
+    for (row, height) in heights.iter().enumerate() {
+        let bottom = top + height;
+        if y >= top && y < bottom {
+            let inset = edge.min(height / 4.0);
+            return (y >= top + inset && y < bottom - inset).then_some(row as i32);
+        }
+        top = bottom;
+    }
+    None
+}
+
 /// The rows a band from `from_y` down to `to_y` crosses, or `None` when it
 /// crosses none: drawn wholly on the ground over the stack or under it, or
 /// over no lanes at all. Not `row_at` at both ends, which clamps a press
@@ -341,6 +357,20 @@ pub fn nearest_row(heights: &[f32], y: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point well inside a lane hits it; one in the seam between two
+    /// lanes, or off the stack, hits none.
+    #[test]
+    fn a_point_in_the_seam_between_lanes_hits_none() {
+        let heights = [40.0, 60.0];
+        assert_eq!(lane_hit(&heights, 20.0, 6.0), Some(0));
+        assert_eq!(lane_hit(&heights, 70.0, 6.0), Some(1));
+        assert_eq!(lane_hit(&heights, 37.0, 6.0), None, "bottom of the first");
+        assert_eq!(lane_hit(&heights, 43.0, 6.0), None, "top of the second");
+        assert_eq!(lane_hit(&heights, -1.0, 6.0), None);
+        assert_eq!(lane_hit(&heights, 100.0, 6.0), None);
+        assert_eq!(lane_hit(&[], 0.0, 6.0), None);
+    }
 
     /// A band on the ground over or under the lanes crosses none of them;
     /// one that reaches into the stack crosses the lanes it reaches.

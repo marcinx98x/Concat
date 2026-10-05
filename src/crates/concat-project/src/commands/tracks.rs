@@ -87,6 +87,15 @@ pub(super) fn apply(
                     effect_id,
                     name,
                 },
+                Command::MoveClips { moves } => Command::MoveClips {
+                    moves: moves
+                        .into_iter()
+                        .map(|wanted| ClipMove {
+                            track_id: id.clone(),
+                            ..wanted
+                        })
+                        .collect(),
+                },
                 _ => return Err(CommandError::NotAPlacement),
             };
             // Staged like a batch, so a refused clip leaves no empty lane.
