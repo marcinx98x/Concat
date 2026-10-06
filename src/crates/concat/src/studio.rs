@@ -106,6 +106,18 @@ const STILL_DURATION: f32 = 5.0;
 /// lanes, and the drop takes a lane of its own.
 const DROP_SEAM: f32 = 6.0;
 
+/// How far, in logical pixels, a pressed clip's pointer must travel before
+/// the press becomes a move or a trim. The clip's own touch area holds the
+/// same distance back, so the edge scroll cannot start under a click.
+const DRAG_DEAD_ZONE: f32 = 4.0;
+
+/// The pointer is still inside the dead zone around a clip's press: under
+/// [`DRAG_DEAD_ZONE`] pixels across, `seconds` at this zoom, and down.
+fn in_dead_zone(seconds: f32, pixels: f32, seconds_per_pixel: f32) -> bool {
+    seconds.abs() / seconds_per_pixel.max(f32::EPSILON) < DRAG_DEAD_ZONE
+        && pixels.abs() < DRAG_DEAD_ZONE
+}
+
 /// One media item's filmstrip, as the lanes tile it.
 pub struct Strip {
     /// Every sampled frame side by side.
@@ -385,6 +397,8 @@ pub enum Gesture {
         /// read live: an `Auto` lane resizes as clips land on it, which
         /// would move the very edges the next event measures against.
         lanes: Vec<f32>,
+        /// The pointer has left the dead zone around the press.
+        started: bool,
     },
     Trim {
         clip: String,
@@ -392,6 +406,7 @@ pub enum Gesture {
         start: f32,
         duration: f32,
         source_start: f32,
+        started: bool,
     },
     /// Dragging a transition's duration handle on the timeline.
     TransitionResize {
@@ -4350,6 +4365,7 @@ impl Studio {
                 start: clip.start as f32,
                 duration: clip.duration as f32,
                 source_start: clip.source_start as f32,
+                started: false,
             };
             return;
         }
@@ -4376,17 +4392,31 @@ impl Studio {
             primary: id.to_owned(),
             origins,
             lanes: self.lane_heights(),
+            started: false,
         };
     }
 
     /// The pointer moved: the echo follows it.
     pub fn clip_dragged(&mut self, seconds: f32, pixels: f32) {
-        let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
+        let mut gesture = std::mem::replace(&mut self.gesture, Gesture::None);
+        // A click that wobbles a pixel or two is still a click: until the
+        // pointer leaves the dead zone nothing moves, or the snap would pull
+        // the clip onto the playhead or a neighbour under a plain press.
+        if let Gesture::Move { started, .. } | Gesture::Trim { started, .. } = &mut gesture
+            && !*started
+        {
+            if in_dead_zone(seconds, pixels, self.lanes.seconds_per_pixel) {
+                self.gesture = gesture;
+                return;
+            }
+            *started = true;
+        }
         match &gesture {
             Gesture::Move {
                 primary,
                 origins,
                 lanes,
+                ..
             } => {
                 let Some(anchor) = origins.iter().find(|origin| &origin.clip == primary) else {
                     self.gesture = gesture;
@@ -4437,6 +4467,7 @@ impl Studio {
                 start,
                 duration,
                 source_start,
+                ..
             } => {
                 let (id, edge) = (clip.clone(), *edge);
                 let (start, duration, source_start) = (*start, *duration, *source_start);
@@ -10427,9 +10458,22 @@ impl Studio {
 mod tests {
     use super::{
         Command, Footprint, Studio, adjust_key_names, chain_colours, chain_rows, custom_frame,
-        custom_rate, fps_of, grading_rows, home_folder, key_commands, lanes_emptied, packed,
-        place_in, shown, wheel_partners, write_keyable,
+        custom_rate, fps_of, grading_rows, home_folder, in_dead_zone, key_commands, lanes_emptied,
+        packed, place_in, shown, wheel_partners, write_keyable,
     };
+
+    /// A press that wobbles under four pixels, either way, is a click; at
+    /// four it is a drag, at any zoom.
+    #[test]
+    fn a_wobbling_click_is_not_a_drag() {
+        let spp = 0.25;
+        assert!(in_dead_zone(0.0, 0.0, spp));
+        assert!(in_dead_zone(3.0 * spp, -3.0, spp));
+        assert!(!in_dead_zone(4.0 * spp, 0.0, spp));
+        assert!(!in_dead_zone(-5.0 * spp, 0.0, spp));
+        assert!(!in_dead_zone(0.0, 4.0, spp));
+        assert!(in_dead_zone(0.3, 0.0, 0.1), "three pixels zoomed out");
+    }
 
     /// A lane the delete takes every clip off goes with them; a lane that
     /// keeps a clip, or was empty to begin with, stays; and the last lane
