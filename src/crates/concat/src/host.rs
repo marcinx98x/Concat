@@ -234,7 +234,7 @@ pub fn spawn_frame<T: Send + 'static>(
     let epoch = project_epoch();
     spawn_detached(move || {
         deliver_then(Some(epoch), work(), then, |studio, app, models| {
-            if studio.playing {
+            if studio.moving() {
                 studio.publish_frame(app, models);
             } else {
                 studio.publish(app, models);
