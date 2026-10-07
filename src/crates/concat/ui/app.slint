@@ -19,7 +19,7 @@ import "../../concat-text/fonts/HankenGrotesk-Italic.ttf";
 import { Theme } from "theme/theme.slint";
 import { Bezier, Curves, Fmt, Focus, Payload } from "util.slint";
 import { EffectData } from "demo/effects-panel.slint";
-import { MediaFilter, MediaItemData, MediaKind, TextPresetData } from "workspace/media-pane.slint";
+import { MediaFilter, MediaItemData, MediaKind, SourcePreview, TextPresetData } from "workspace/media-pane.slint";
 import { ContextMenu, MenuItemData, MenuRow } from "primitives/context-menu.slint";
 import { ExportData, ExportDialog, ExportPhase } from "dialogs/export.slint";
 import { ModelData, SettingsData, SettingsDialog, SystemFactData } from "dialogs/settings.slint";
@@ -40,6 +40,8 @@ import {
 import { ParamFormat } from "inspector/controls.slint";
 import { ToastData, ToastLayer } from "primitives/toast.slint";
 import { TooltipLayer } from "primitives/tooltip.slint";
+import { FontSearch } from "inspector/font-picker.slint";
+import { Meters } from "workspace/meters-pane.slint";
 import { Workspace } from "workspace/workspace.slint";
 import {
     ClipData, ClipField, ClipKeyData, ClipKind, ClipTextField, DropData, Keyframes,
@@ -49,15 +51,14 @@ import {
 
 // Re-exported so main.rs can reach the globals and the struct.
 import { KeyEditor, KeyMarkData, KeyRowData } from "workspace/keyframes-pane.slint";
-import { ScopeMarkData, Scopes } from "workspace/scopes-pane.slint";
 
 export {
     Curves, Fmt, Focus, Payload, Theme, Bezier, Editor, I18n,
     AppliedEntryData, AppliedParamData, CatalogueEntryData, Library, LibraryViewData, ParamFormat,
     DockDivider, DockSide, PaneKind, SeatBox,
-    EffectData, MediaFilter, MediaItemData, MediaKind, TextPresetData,
+    EffectData, FontSearch, Meters, MediaFilter, MediaItemData, MediaKind, SourcePreview, TextPresetData,
     ClipData, ClipField, ClipKeyData, ClipKind, ClipTextField, DropData, Keyframes,
-    KeyEditor, KeyMarkData, KeyRowData, ScopeMarkData, Scopes,
+    KeyEditor, KeyMarkData, KeyRowData,
     SelectedClipData, SelectedTransitionData, StageGuideData, StageItemData, TextAlignment, TimelineTabData,
     TimelineTool, TrackData, TrackSize, MenuItemData, MenuRow, ExportData, ExportPhase, ModelData, SettingsData,
     ChipOption, RecentProjectData, StartData, SystemFactData, ToastData, ProjectSheetData,

@@ -24,6 +24,7 @@ pub mod settings;
 pub mod speech;
 pub mod start;
 pub mod timeline;
+pub mod voiceover;
 
 /// One thing that happened, to one pane.
 #[derive(Debug)]
@@ -48,6 +49,8 @@ pub enum Msg {
     Monitor(monitor::MonitorMsg),
     /// To the timeline's view.
     Timeline(timeline::TimelineMsg),
+    /// To the voiceover take.
+    Voiceover(voiceover::VoiceoverMsg),
 }
 
 /// What a message says in the log: the activity trail of what the person
@@ -69,7 +72,7 @@ pub fn activity(msg: &Msg) -> Option<Activity> {
     use timeline::TimelineMsg;
 
     match msg {
-        Msg::Monitor(MonitorMsg::Frame(..) | MonitorMsg::Request | MonitorMsg::ScopePoll)
+        Msg::Monitor(MonitorMsg::Frame(..) | MonitorMsg::Request)
         | Msg::Timeline(
             TimelineMsg::Hovered(_)
             | TimelineMsg::HoverEnded

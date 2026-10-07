@@ -7,11 +7,11 @@ import { DockSide } from "../dock.slint";
 import { PaneKind } from "pane-switcher.slint";
 import { Editor } from "../editor.slint";
 import { ConfigPane } from "config-pane.slint";
-import { MediaPane } from "media-pane.slint";
+import { MediaPane, SourcePreview } from "media-pane.slint";
 import { PreviewPane } from "preview-pane.slint";
 import { TimelinePane } from "timeline-pane.slint";
 import { KeyframesPane } from "keyframes-pane.slint";
-import { ScopesPane } from "scopes-pane.slint";
+import { MetersPane } from "meters-pane.slint";
 
 // One box of the workspace, showing whichever view its `kind` names.
 //
@@ -127,7 +127,8 @@ export component Seat inherits Rectangle {
             menu-token: Editor.menu-token;
             menu-selected(id) => { Editor.menu-selected(id); }
 
-            presets: Editor.text-presets;
+            presets: Editor.style-presets;
+            language-presets: Editor.language-presets;
             catalogue-effects: Editor.catalogue-effects;
             catalogue-audio: Editor.catalogue-audio;
             catalogue-filters: Editor.catalogue-filters;
@@ -167,14 +168,17 @@ export component Seat inherits Rectangle {
             frame-rate: Editor.frame-rate;
             ratio-index: Editor.ratio-index;
             quality-index: Editor.quality-index;
-            playhead: Editor.playhead;
-            duration: Editor.preview-duration;
-            playhead-free: Editor.playhead-free;
-            playing: Editor.playing;
+            // A library file on the monitor has its transport: the readout,
+            // the play button and the timecode run through the source.
+            playhead: SourcePreview.open ? SourcePreview.time : Editor.playhead;
+            duration: SourcePreview.open ? SourcePreview.duration : Editor.preview-duration;
+            playhead-free: Editor.playhead-free && !SourcePreview.open;
+            playing: SourcePreview.open ? SourcePreview.playing : Editor.playing;
+            source-name: SourcePreview.open ? SourcePreview.name : "";
             has-picture: Editor.has-picture;
             clip-name: Editor.preview-clip-name;
             frame: Editor.preview-frame;
-            stage-items: Editor.stage-items;
+            stage-items: SourcePreview.open ? [] : Editor.stage-items;
             stage-guides: Editor.stage-guides;
             stroke-path: Editor.stroke-path;
             stroke-width: Editor.stroke-width;
@@ -182,8 +186,21 @@ export component Seat inherits Rectangle {
             painting: Editor.painting && Editor.selected-clip.cutout == 2;
 
             play-toggled => { Editor.play-toggled(); }
-            seek(seconds) => { Editor.seek(seconds); }
-            step(frames) => { Editor.step-frames(frames); }
+            seek(seconds) => {
+                if (SourcePreview.open) {
+                    SourcePreview.seek(seconds);
+                } else {
+                    Editor.seek(seconds);
+                }
+            }
+            step(frames) => {
+                if (SourcePreview.open) {
+                    SourcePreview.seek(SourcePreview.time + frames / Editor.frame-rate);
+                } else {
+                    Editor.step-frames(frames);
+                }
+            }
+            source-closed => { SourcePreview.closed(); }
             ratio-changed(index) => { Editor.ratio-changed(index); }
             quality-changed(index) => { Editor.quality-changed(index); }
             stage-pressed(x, y, additive) => {
@@ -316,7 +333,7 @@ export component Seat inherits Rectangle {
         }
     }
 
-    if root.kind == PaneKind.scopes: ScopesPane {
+    if root.kind == PaneKind.meters: MetersPane {
             x: 0;
             y: 0;
             width: root.width;
@@ -377,6 +394,8 @@ export component Seat inherits Rectangle {
             title-selected: Editor.title-selected;
             picture-selected: Editor.picture-selected;
             freezable: Editor.freezable;
+            recording: Editor.recording;
+            record-level: Editor.record-level;
             reversible: Editor.reversible;
             playhead: Editor.playhead;
             frame-rate: Editor.frame-rate;
@@ -406,6 +425,7 @@ export component Seat inherits Rectangle {
             delete-selected => { Editor.delete-selected(); }
             captions => { Editor.captions(); }
             speak => { Editor.speak(); }
+            record-voiceover => { Editor.record-voiceover(); }
             add-track(bottom) => { Editor.add-track(bottom); }
             zoom-to-fit(width) => { Editor.zoom-to-fit(width); }
             zoom(factor, anchor) => { Editor.zoom(factor, anchor); }

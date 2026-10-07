@@ -170,7 +170,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libgl1-mesa-dev \
-            libgtk-3-dev libasound2-dev libclang-dev cmake
+            libgtk-3-dev libasound2-dev libclang-dev cmake libxkbcommon-x11-0
 
       # Ubuntu's packaged FFmpeg is older than the 7 the engine needs.
       - name: FFmpeg development libraries (Linux)
@@ -451,6 +451,7 @@ jobs:
             <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
             <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
             <key>NSHumanReadableCopyright</key><string>AGPL-3.0-or-later. See THIRD_PARTY_NOTICES.md.</string>
+            <key>NSMicrophoneUsageDescription</key><string>Concat records voiceovers from your microphone.</string>
           </dict>
           </plist>
           PLIST
@@ -501,8 +502,15 @@ jobs:
             # signature covers what is beneath it.
             find "$app/Contents/Frameworks" -name '*.dylib' -exec \
               codesign --force --options runtime --timestamp -s "$IDENTITY" {} \;
-            codesign --force --options runtime --timestamp -s "$IDENTITY" "$app/Contents/MacOS/concat"
-            codesign --force --options runtime --timestamp -s "$IDENTITY" "$app"
+            # The hardened runtime keeps the microphone shut unless the app
+            # says it records: the voiceover.
+            entitlements="$RUNNER_TEMP/concat.entitlements"
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>' \
+              > "$entitlements"
+            codesign --force --options runtime --timestamp --entitlements "$entitlements" -s "$IDENTITY" "$app/Contents/MacOS/concat"
+            codesign --force --options runtime --timestamp --entitlements "$entitlements" -s "$IDENTITY" "$app"
             codesign --verify --deep --strict "$app"
           else
             echo "No signing identity: ad-hoc signing."
@@ -646,6 +654,13 @@ jobs:
           mkdir -p "$appdir/usr/bin" "$appdir/usr/share/icons/hicolor/256x256/apps" "$appdir/usr/share/applications"
           cp "$STAGE/concat" "$appdir/usr/bin/concat"
           cp -a "$STAGE/lib" "$appdir/usr/bin/lib"
+          # The X11 keyboard library the window opens by name at start, and
+          # the xcb extension under it: a machine without them panicked
+          # before showing a window, which is how the AppImage catalog's
+          # test saw it. Beside the binary, the rpath finds them.
+          for lib in libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
+            cp -L "$(ldconfig -p | awk -v lib="$lib" '$1 == lib { print $NF; exit }')" "$appdir/usr/bin/lib/$lib"
+          done
           cp "$STAGE/concat.desktop" "$appdir/concat.desktop"
           cp "$STAGE/concat.desktop" "$appdir/usr/share/applications/concat.desktop"
           cp "$STAGE/concat.png" "$appdir/concat.png"

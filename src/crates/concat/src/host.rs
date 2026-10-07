@@ -248,7 +248,7 @@ pub fn spawn_frame<T: Send + 'static>(
             },
             move |studio, app, models| {
                 if studio.moving() && !toasted.load(Ordering::Relaxed) {
-                    studio.publish_frame(app, models);
+                    studio.publish_frame(app);
                 } else {
                     studio.publish(app, models);
                 }

@@ -104,6 +104,10 @@ export global Editor {
     // library catalogue pages
     /// The looks the Text page offers, published once.
     in-out property <[TextPresetData]> text-presets;
+    /// The Latin presets, for the desktop's Styles shelf.
+    in-out property <[TextPresetData]> style-presets;
+    /// The presets for other writing, for its Languages shelf.
+    in-out property <[TextPresetData]> language-presets;
     /// A title placed at the playhead in the look `preset` names;
     /// "default" is the plain title.
     callback library-add-text(preset: string);
@@ -361,6 +365,12 @@ export global Editor {
     /// of the clip's own menu - see `clip-context`.
     callback captions();
     callback speak();
+    /// The tray's record button: starts a voiceover take, or stops it.
+    callback record-voiceover();
+    /// A voiceover take is running.
+    in-out property <bool> recording;
+    /// The take's level, `0..1`, for the meter beside the button.
+    in-out property <float> record-level;
     callback add-track(bottom: bool);
     callback zoom-to-fit(width: length);
     callback zoom(factor: float, anchor-seconds: float);

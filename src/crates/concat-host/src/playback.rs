@@ -44,7 +44,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use concat_core::animate::{Ease, Key, Track};
@@ -290,6 +290,15 @@ struct Shared {
     origin_micros: AtomicI64,
     epoch: std::time::Instant,
     playing: AtomicBool,
+    /// Silent while set: the clock runs on, the speakers say nothing. A
+    /// voiceover takes the picture without the timeline's sound, so the
+    /// speakers do not bleed into the microphone.
+    muted: AtomicBool,
+    /// The loudest sample each side has sent the speakers since the meters
+    /// last looked, before the hard limit, as f32 bits: what the VU meters
+    /// show. Above 1.0 is a mix that clipped.
+    peak_left: AtomicU32,
+    peak_right: AtomicU32,
 }
 
 /// The longest the clock runs on past the callback's last word. A callback
@@ -304,6 +313,9 @@ impl Shared {
             origin_micros: AtomicI64::new(0),
             epoch: std::time::Instant::now(),
             playing: AtomicBool::new(false),
+            muted: AtomicBool::new(false),
+            peak_left: AtomicU32::new(0),
+            peak_right: AtomicU32::new(0),
         }
     }
 
@@ -531,6 +543,22 @@ impl Playback {
     /// Whether the transport is rolling.
     pub fn is_playing(&self) -> bool {
         self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    /// The loudest sample each side has played since the last call, left
+    /// and right, linear: 1.0 is full scale and above it a mix that
+    /// clipped. Reading resets them: the meters' feed.
+    pub fn take_levels(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.shared.peak_left.swap(0, Ordering::Relaxed)),
+            f32::from_bits(self.shared.peak_right.swap(0, Ordering::Relaxed)),
+        )
+    }
+
+    /// Silences the output, or lets it speak again. The clock is not
+    /// touched: the picture plays on in time either way.
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.muted.store(muted, Ordering::Relaxed);
     }
 
     /// Replaces the audible clip set.
@@ -1102,6 +1130,8 @@ where
                     return;
                 }
 
+                let silent = shared.muted.load(Ordering::Relaxed);
+                let (mut loudest_left, mut loudest_right) = (0.0f32, 0.0f32);
                 for frame in data.chunks_mut(channels) {
                     let mut left = 0.0f32;
                     let mut right = 0.0f32;
@@ -1131,6 +1161,12 @@ where
                                 + pcm.sample(index + 1, 1) * fraction);
                     }
 
+                    if silent {
+                        left = 0.0;
+                        right = 0.0;
+                    }
+                    loudest_left = loudest_left.max(left.abs());
+                    loudest_right = loudest_right.max(right.abs());
                     // Hard limit. A mix of boosted clips can exceed full
                     // scale; wrapping would be far worse than flattening.
                     frame[0] = T::from_sample(left.clamp(-1.0, 1.0));
@@ -1142,6 +1178,18 @@ where
                     }
 
                     position += step;
+                }
+
+                // One writer, so a load and a store keep the larger without
+                // a compare loop; the meters' swap may land between them and
+                // lose one buffer's peak, which no eye can see.
+                for (cell, loudest) in [
+                    (&shared.peak_left, loudest_left),
+                    (&shared.peak_right, loudest_right),
+                ] {
+                    if loudest > f32::from_bits(cell.load(Ordering::Relaxed)) {
+                        cell.store(loudest.to_bits(), Ordering::Relaxed);
+                    }
                 }
 
                 shared.stamp(position);

@@ -14,6 +14,11 @@ pub const SEAT_MIN_H: f32 = 140.0;
 pub const SEAT_MIN_GRAB: f32 = 64.0;
 /// The gutter between the halves of a split, and the margin round the lot.
 pub const SEAT_GAP: f32 = 8.0;
+/// The VU meters' column needs only its bars and its scale.
+pub const METERS_MIN_W: f32 = 64.0;
+/// The meters' share of the bottom row in the default layout: a slim
+/// column beside the timeline, at its full height.
+const METERS_SHARE: f32 = 0.045;
 
 pub enum Dock {
     /// One view, filling its box.
@@ -32,14 +37,6 @@ pub enum Dock {
 impl Dock {
     pub fn leaf(kind: PaneKind) -> Box<Dock> {
         Box::new(Dock::Leaf(kind))
-    }
-
-    /// Whether any seat shows `kind`.
-    pub fn holds(&self, kind: PaneKind) -> bool {
-        match self {
-            Dock::Leaf(leaf) => *leaf == kind,
-            Dock::Split { first, second, .. } => first.holds(kind) || second.holds(kind),
-        }
     }
 
     /// The node a path names, following each step into the first branch or the
@@ -274,7 +271,13 @@ pub fn default_dock() -> Dock {
                 second: Dock::leaf(PaneKind::Inspector),
             }),
         }),
-        second: Dock::leaf(PaneKind::Timeline),
+        // The timeline, and the VU meters in a slim column beside it.
+        second: Box::new(Dock::Split {
+            columns: true,
+            ratio: 1.0 - METERS_SHARE,
+            first: Dock::leaf(PaneKind::Timeline),
+            second: Dock::leaf(PaneKind::Meters),
+        }),
     }
 }
 
@@ -383,16 +386,5 @@ mod tests {
         assert_eq!(band_rows(&heights, -10.0, 70.0), Some((0, 1)));
         assert_eq!(band_rows(&heights, 115.0, 300.0), Some((2, 2)));
         assert_eq!(band_rows(&[], 0.0, 0.0), None, "no lanes");
-    }
-
-    /// A kind is on screen when any seat shows it, however deep the split.
-    #[test]
-    fn a_dock_knows_what_it_shows() {
-        let mut dock = default_dock();
-        assert!(dock.holds(PaneKind::Preview));
-        assert!(!dock.holds(PaneKind::Scopes));
-        let path = dock.leaf_path(0).expect("a first seat");
-        dock.split_leaf(&path, PaneKind::Scopes, DockSide::Right);
-        assert!(dock.holds(PaneKind::Scopes));
     }
 }

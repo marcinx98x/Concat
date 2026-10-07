@@ -33,11 +33,13 @@ mod ui {
 
 mod chips;
 mod dock;
+mod fonts;
 mod format;
 mod gpu;
 mod grading;
 mod host;
 mod i18n;
+mod meters;
 mod platform;
 /// What a phone's own crate installs before the window runs: the way to
 /// the system's file picker. See `platform::pick_files_async`.
@@ -46,6 +48,7 @@ pub use platform::{FilePicker, install_file_picker};
 mod panes;
 mod prefs;
 mod presets;
+mod source;
 mod studio;
 mod sysinfo;
 /// Native Wayland file drops, which winit does not report; see the module.
@@ -75,7 +78,7 @@ mod wayland_drop {
     }
 }
 
-use dock::{Dock, SEAT_MIN_GRAB, SEAT_MIN_H, SEAT_MIN_W};
+use dock::{Dock, METERS_MIN_W, SEAT_MIN_GRAB, SEAT_MIN_H, SEAT_MIN_W};
 use host::{Host, Shell, on_ui};
 use panes::Msg;
 use panes::captions::CaptionsMsg;
@@ -159,6 +162,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
         }
     };
 
+    // The base fonts, so the preset cards can be drawn in them.
+    fonts::register();
     let app = App::new()?;
     app.set_macos(platform::MACOS);
     // A phone wears the phone shell - see ui/phone/ - and its lanes keep
@@ -257,8 +262,6 @@ pub fn run() -> Result<(), slint::PlatformError> {
         editor.set_visual_wheels(ModelRc::from(models.visual_wheels.clone()));
         editor.set_visual_curves(ModelRc::from(models.visual_curves.clone()));
         editor.set_visual_colours(ModelRc::from(models.visual_colours.clone()));
-        app.global::<Scopes>()
-            .set_marks(ModelRc::from(models.scope_marks.clone()));
         app.global::<Keyframes>()
             .set_rows(ModelRc::from(models.key_rows.clone()));
         app.global::<KeyEditor>()
@@ -285,7 +288,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
         editor.set_dividers(ModelRc::from(models.dividers.clone()));
         app.set_recents(ModelRc::from(models.recents.clone()));
         editor.set_text_presets(ModelRc::from(models.text_presets.clone()));
+        editor.set_style_presets(ModelRc::from(models.style_presets.clone()));
+        editor.set_language_presets(ModelRc::from(models.language_presets.clone()));
         editor.set_font_families(ModelRc::from(models.font_families.clone()));
+        app.global::<FontSearch>()
+            .set_matches(ModelRc::from(models.font_matches.clone()));
     }
 
     // Settings > About's block, gathered once: nothing in it changes while
@@ -602,16 +609,31 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let Some(path) = state.dock.split_path(held) else {
             return;
         };
+        // A side that is only the meters may be as narrow as its bars;
+        // every other seat keeps the width its controls need.
+        let narrow = |node: &Dock| matches!(node, Dock::Leaf(PaneKind::Meters));
+        let (first_narrow, second_narrow) = match state.dock.at(&path) {
+            Dock::Split { first, second, .. } => (narrow(first), narrow(second)),
+            Dock::Leaf(_) => (false, false),
+        };
         let Dock::Split { columns, ratio, .. } = state.dock.at_mut(&path) else {
             return;
         };
         let wanted = if *columns { SEAT_MIN_W } else { SEAT_MIN_H };
-        let floor = if wanted * 2.0 <= extent {
-            wanted
-        } else {
-            SEAT_MIN_GRAB.min(extent / 2.0)
-        } / extent;
-        *ratio = (from + delta / extent).clamp(floor, 1.0 - floor);
+        let side = |is_narrow: bool| {
+            if is_narrow && *columns {
+                METERS_MIN_W
+            } else if wanted * 2.0 <= extent {
+                wanted
+            } else {
+                SEAT_MIN_GRAB.min(extent / 2.0)
+            }
+        };
+        let (low, high) = (
+            side(first_narrow) / extent,
+            1.0 - side(second_narrow) / extent,
+        );
+        *ratio = (from + delta / extent).clamp(low, high.max(low));
     }));
 
     // ── the bin ──
@@ -1126,13 +1148,30 @@ pub fn run() -> Result<(), slint::PlatformError> {
     editor.on_quality_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Monitor(MonitorMsg::QualityChanged(index)));
     }));
-    app.global::<Scopes>()
-        .on_kind_changed(on_window!(|state, index: i32| {
-            state.handle(Msg::Monitor(MonitorMsg::ScopeKind(index)));
-        }));
     editor.on_play_toggled(on_window!(|state| {
         state.play_toggle();
     }));
+    app.global::<FontSearch>()
+        .on_query_changed(on_window!(|state, text: SharedString| {
+            state.font_query = text.to_string();
+        }));
+    app.global::<Meters>().on_clip_cleared({
+        let weak = app.as_weak();
+        move || {
+            if let Some(app) = weak.upgrade() {
+                crate::host::Shell::with(|shell, _| {
+                    shell.studio.borrow_mut().meters.clear_clip(&app);
+                });
+            }
+        }
+    });
+    app.global::<SourcePreview>().on_closed(on_window!(|state| {
+        state.close_source();
+    }));
+    app.global::<SourcePreview>()
+        .on_seek(on_window!(|state, seconds: f32| {
+            state.source_seek(f64::from(seconds));
+        }));
 
     // ── the stage ──
     editor.on_stage_pressed(on_window!(|state, x: f32, y: f32, additive: bool| {
@@ -1512,6 +1551,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // ── the tray's sound and word tools ──
     editor.on_captions(on_window!(|state| {
         state.handle(Msg::Captions(CaptionsMsg::Open));
+    }));
+    editor.on_record_voiceover(on_window!(|state| {
+        state.handle(Msg::Voiceover(
+            crate::panes::voiceover::VoiceoverMsg::Toggle,
+        ));
     }));
     editor.on_speak(on_window!(|state| {
         state.handle(Msg::Speech(SpeechMsg::Open));

@@ -719,8 +719,6 @@ pub struct Models {
     pub visual_curves: Rc<VecModel<CurveGroupData>>,
     /// The picture's chain's colour knobs, a row each.
     pub visual_colours: Rc<VecModel<ColourKnobData>>,
-    /// The Scopes pane's scale.
-    pub scope_marks: Rc<VecModel<ScopeMarkData>>,
     /// A link's wheels and curves, and a curve's points, by the link - -1
     /// the colour panel - and the curve's key: kept like the rest, so a
     /// wheel or a point being dragged is not dropped when it is published
@@ -760,8 +758,14 @@ pub struct Models {
     pub recents: Rc<VecModel<RecentProjectData>>,
     /// The Text page's presets, published once from the loaded list.
     pub text_presets: Rc<VecModel<TextPresetData>>,
+    /// The Latin ones, for the Text page's Styles shelf.
+    pub style_presets: Rc<VecModel<TextPresetData>>,
+    /// The rest, by the writing they are for, for its Languages shelf.
+    pub language_presets: Rc<VecModel<TextPresetData>>,
     /// The families a title can be set in; see `Studio::font_families`.
     pub font_families: Rc<VecModel<SharedString>>,
+    /// Those of them the font picker's search lets through.
+    pub font_matches: Rc<VecModel<SharedString>>,
 }
 
 impl Models {
@@ -792,7 +796,6 @@ impl Models {
             adjust_curves: Rc::new(VecModel::default()),
             visual_wheels: Rc::new(VecModel::default()),
             visual_colours: Rc::new(VecModel::default()),
-            scope_marks: Rc::new(VecModel::default()),
             visual_curves: Rc::new(VecModel::default()),
             link_wheels: RefCell::new(HashMap::new()),
             link_curves: RefCell::new(HashMap::new()),
@@ -820,7 +823,10 @@ impl Models {
             dividers: Rc::new(VecModel::default()),
             recents: Rc::new(VecModel::default()),
             text_presets: Rc::new(VecModel::default()),
+            style_presets: Rc::new(VecModel::default()),
+            language_presets: Rc::new(VecModel::default()),
             font_families: Rc::new(VecModel::default()),
+            font_matches: Rc::new(VecModel::default()),
         }
     }
 }
@@ -1046,6 +1052,13 @@ pub struct Studio {
     pub project_sheet: crate::panes::project::ProjectPane,
     pub captions: crate::panes::captions::CaptionsPane,
     pub speech: crate::panes::speech::SpeechPane,
+    /// A file from the library lent the monitor and the speakers; see
+    /// `crate::source`.
+    pub source: Option<crate::source::Source>,
+    /// The VU meters' feed; see `crate::meters`.
+    pub meters: crate::meters::MeterFeed,
+    /// The voiceover take, while one runs.
+    pub voiceover: crate::panes::voiceover::VoiceoverPane,
     /// Every speaker the voice engine offers, in its own order.
     /// The looks the Text page offers; see `presets`.
     pub text_presets: Vec<TextPreset>,
@@ -1061,6 +1074,11 @@ pub struct Studio {
     /// A fingerprint of what `font_families` was last published from, so
     /// a publish that changes none of it leaves the picker's list alone.
     fonts_published: std::cell::Cell<Option<u64>>,
+    /// What the font picker's search box holds.
+    pub font_query: String,
+    /// The families and the query the search's matches were last
+    /// published from, hashed.
+    font_search_published: std::cell::Cell<Option<u64>>,
 
     /// The languages Settings › General offers, in its order; see `i18n`.
     pub languages: Vec<i18n::Language>,
@@ -2165,10 +2183,15 @@ impl Studio {
             project_sheet: crate::panes::project::ProjectPane::default(),
             captions: crate::panes::captions::CaptionsPane::default(),
             speech: crate::panes::speech::SpeechPane::default(),
+            source: None,
+            meters: crate::meters::MeterFeed::default(),
+            voiceover: crate::panes::voiceover::VoiceoverPane::default(),
             text_presets,
             installed_fonts: presets::installed_fonts(&host.dirs),
             system_fonts: Vec::new(),
             fonts_published: std::cell::Cell::new(None),
+            font_query: String::new(),
+            font_search_published: std::cell::Cell::new(None),
             languages,
             brush: 0,
             brush_size: 0.06,
@@ -2622,46 +2645,16 @@ impl Studio {
     }
 
     /// The audible clip set, handed to playback whenever the edit changes.
-    fn sync_audio(&mut self) {
+    /// Not while a library file has the speakers: the timeline's sound is
+    /// handed back when it lets them go.
+    pub(crate) fn sync_audio(&mut self) {
+        if self.source.is_some() {
+            return;
+        }
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let clips = session.flattened_clips();
-        let specs: Vec<ClipSpec> = clips
-            .iter()
-            .filter(|clip| {
-                !clip.muted
-                    && (clip.kind == concat_export::ClipKind::Audio
-                        || (clip.kind == concat_export::ClipKind::Video
-                            && clip.has_audio.unwrap_or(true)))
-            })
-            // Through the exporter's own cut into pieces, so a curve or a
-            // reverse sounds in the window as it will in the file.
-            .flat_map(concat_export::audio_pieces)
-            .map(|piece| ClipSpec {
-                path: piece.path.to_string_lossy().into_owned(),
-                audio_stream: piece.stream.map(|index| index as u32),
-                start: piece.start,
-                duration: piece.duration,
-                source_start: piece.source_start,
-                volume: piece.volume as f32,
-                volume_curve: piece
-                    .volume_curve
-                    .keys()
-                    .iter()
-                    .map(|key| concat_host::playback::GainKey {
-                        at: key.at,
-                        gain: key.value,
-                        ease: [key.ease.x1, key.ease.y1, key.ease.x2, key.ease.y2],
-                    })
-                    .collect(),
-                fade_in: piece.fade_in,
-                fade_out: piece.fade_out,
-                speed: piece.speed,
-                preserve_pitch: piece.preserve_pitch,
-                chain: piece.filter_chain,
-            })
-            .collect();
+        let specs = audio_specs(&session.flattened_clips());
         self.host
             .playback
             .set_clips(std::path::PathBuf::from(session.path()), specs);
@@ -2688,6 +2681,10 @@ impl Studio {
         concat_project::DocumentSettings,
     )> {
         let session = self.session.as_ref()?;
+        // A library file on the monitor: its clip alone, flattened once.
+        if let Some(source) = self.source.as_ref() {
+            return Some((std::sync::Arc::clone(&source.clips), session.settings()));
+        }
         // The echo when there is one: a picture being dragged on the stage
         // is drawn where the pointer has it, not where the document last
         // had it. Same flattening the session does for itself, project
@@ -2839,6 +2836,11 @@ impl Studio {
 
     pub fn play_toggle(&mut self) {
         self.end_audition();
+        // The monitor's play button and Space play what it shows.
+        if self.source.is_some() {
+            self.source_toggle();
+            return;
+        }
         if self.playing {
             self.pause();
             return;
@@ -2857,6 +2859,7 @@ impl Studio {
         self.playing = true;
         log::debug!("playback: playing from {:.3}s", self.playhead);
         self.host.playback.play(f64::from(self.playhead));
+        self.meters.wake();
         // The clock is the audio device's. This looks at it far more often
         // than any timeline's frame rate and acts only when the frame under
         // it changes, so each frame is asked for within a few milliseconds of
@@ -2930,6 +2933,8 @@ impl Studio {
     /// last clip and something placed at the playhead there.
     pub fn seek(&mut self, seconds: f32) {
         self.end_audition();
+        // The timeline was clicked: it has the monitor back.
+        self.close_source();
         self.playhead = seconds.max(0.0);
         if self.prefs.playhead_stops_at_end {
             self.playhead = self.playhead.min(self.duration().max(0.0));
@@ -2945,6 +2950,9 @@ impl Studio {
     /// The instant the monitor shows: the pointer's while it crosses the
     /// lanes with the preview axis on, else the playhead's.
     pub fn preview_time(&self) -> f32 {
+        if let Some(source) = self.source.as_ref() {
+            return source.time as f32;
+        }
         self.audition
             .as_ref()
             .map(|audition| audition.at)
@@ -3759,9 +3767,11 @@ impl Studio {
     }
 
     /// Whether the monitor is running through frames: the transport is
-    /// playing, or a card's preview is looping.
+    /// playing, a card's preview is looping, or a source is playing.
     pub fn moving(&self) -> bool {
-        self.playing || self.audition.is_some()
+        self.playing
+            || self.audition.is_some()
+            || self.source.as_ref().is_some_and(|source| source.playing)
     }
 
     /// Plays a look or picture effect over the whole picture from the
@@ -3827,6 +3837,7 @@ impl Studio {
         if self.playing {
             self.pause();
         }
+        self.close_source();
         self.end_hover();
         let from = audition.from;
         self.audition = Some(audition);
@@ -4731,18 +4742,28 @@ impl Studio {
                 let (start, duration, source_start) = (*start, *duration, *source_start);
                 let threshold = 8.0 * self.lanes.seconds_per_pixel;
                 let speed = self.clip(&id).map_or(1.0, |clip| clip.speed as f32);
-                // The neighbours on its lane: an edge stops where the clip
-                // before ends and the one after starts, never covering them.
-                let (before, after) = self.lane_neighbours(&id, start, start + duration);
+                // A plain trim stops at the neighbours, as the command will;
+                // a magnetic one moves them, so the lane is all its room.
+                let (floor, ceiling) = if self.prefs.magnetic {
+                    (0.0, f32::INFINITY)
+                } else {
+                    self.timeline()
+                        .room_around(&id)
+                        .map_or((0.0, f32::INFINITY), |(before, after)| {
+                            (before as f32, after as f32)
+                        })
+                };
                 if edge == Edge::Start {
                     // The head cannot pass the tail, and cannot pull material
                     // out of a file that has none before the in-point.
                     let wanted = self.snapped(start + seconds, threshold, &id);
                     let limit = start + duration - MIN_DURATION;
-                    let floor = (start - source_start / speed.max(0.01))
-                        .max(0.0)
-                        .max(before);
-                    let at = wanted.clamp(floor.min(limit), limit);
+                    let at = wanted.clamp(
+                        (start - source_start / speed.max(0.01))
+                            .max(floor)
+                            .min(limit),
+                        limit,
+                    );
                     let delta = at - start;
                     if let Some(clip) = self.echo_clip_mut(&id) {
                         clip.start = f64::from(at);
@@ -4755,11 +4776,7 @@ impl Studio {
                     }
                 } else {
                     let wanted = self.snapped(start + duration + seconds, threshold, &id);
-                    let mut at = wanted.max(start + MIN_DURATION);
-                    // Magnetic, the clips after move along with the tail.
-                    if !self.prefs.magnetic {
-                        at = at.min(after.max(start + MIN_DURATION));
-                    }
+                    let at = wanted.min(ceiling).max(start + MIN_DURATION);
                     if let Some(clip) = self.echo_clip_mut(&id) {
                         clip.duration = f64::from(at - start);
                     }
@@ -4840,31 +4857,6 @@ impl Studio {
             fresh[lane].1.push(wanted);
         }
         (clear, fresh)
-    }
-
-    /// Where the clip before `id` on its lane ends and the one after it
-    /// starts, around the span `[start, end)` the clip had when the trim
-    /// began: 0 and infinity when there is none.
-    fn lane_neighbours(&self, id: &str, start: f32, end: f32) -> (f32, f32) {
-        let Some(track) = self.clip(id).map(|clip| clip.track_id.clone()) else {
-            return (0.0, f32::INFINITY);
-        };
-        let slack = self.frame_seconds() / 2.0;
-        let (start, end) = (f64::from(start), f64::from(end));
-        self.timeline()
-            .clips
-            .iter()
-            .filter(|other| other.id != id && other.track_id == track)
-            .fold((0.0, f32::INFINITY), |(before, after), other| {
-                let other_end = other.start + other.duration;
-                if other_end <= start + slack {
-                    (before.max(other_end as f32), after)
-                } else if other.start >= end - slack {
-                    (before, after.min(other.start as f32))
-                } else {
-                    (before, after)
-                }
-            })
     }
 
     /// Whether `[start, end)` on `track` overlaps a clip not in `skip`, by
@@ -7677,6 +7669,11 @@ impl Studio {
         self.captions.progress = 0.0;
         self.speech.running = false;
         self.speech.progress = 0.0;
+        self.source = None;
+        // A take running as the project closes stops, keeping its file;
+        // the next project's speakers are not left silent.
+        self.voiceover = Default::default();
+        self.host.playback.set_muted(false);
         self.echo = None;
         self.dirty = false;
         self.selection.clear();
@@ -7754,6 +7751,11 @@ impl Studio {
                 let mut pane = std::mem::take(&mut self.speech);
                 pane.update(msg, self);
                 self.speech = pane;
+            }
+            crate::panes::Msg::Voiceover(msg) => {
+                let mut pane = std::mem::take(&mut self.voiceover);
+                pane.update(msg, self);
+                self.voiceover = pane;
             }
             crate::panes::Msg::Relink(msg) => {
                 let mut pane = std::mem::take(&mut self.relink);
@@ -8100,22 +8102,11 @@ impl Studio {
         }
     }
 
-    /// The monitor's picture and the scope counted from it, alone: what a
-    /// frame arriving during playback changes.
-    pub fn publish_frame(&self, app: &App, models: &Models) {
+    /// The monitor's picture alone: what a frame arriving during playback
+    /// changes.
+    pub fn publish_frame(&self, app: &App) {
         app.global::<Editor>()
             .set_preview_frame(self.monitor.image.clone());
-        let scopes = app.global::<Scopes>();
-        scopes.set_kind(self.monitor.scope_kind as i32);
-        match &self.monitor.scope {
-            Some((picture, marks, hdr)) => {
-                scopes.set_picture(picture.clone());
-                sync(&models.scope_marks, marks.clone());
-                scopes.set_hdr(*hdr);
-                scopes.set_ready(true);
-            }
-            None => scopes.set_ready(false),
-        }
     }
 
     /// The timeline and the readouts that follow it: what runs on every
@@ -8250,7 +8241,7 @@ impl Studio {
         editor.set_preview_duration(self.duration());
         editor.set_playhead_free(!self.prefs.playhead_stops_at_end);
         editor.set_playing(self.playing);
-        self.publish_frame(app, models);
+        self.publish_frame(app);
         sync(&models.stage, self.stage_items());
         sync(&models.guides, self.stage_guides.clone());
         let (path, width, erase) = self.stroke_overlay();
@@ -8313,14 +8304,28 @@ impl Studio {
         keys.set_available(!rows.is_empty());
         sync(&models.key_rows, rows);
         let fonts = Some(self.fonts_fingerprint());
-        if self.fonts_published.get() != fonts {
+        let searched = Some({
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (fonts, &self.font_query).hash(&mut hasher);
+            hasher.finish()
+        });
+        if self.fonts_published.get() != fonts || self.font_search_published.get() != searched {
             self.fonts_published.set(fonts);
+            self.font_search_published.set(searched);
+            let families = self.font_families();
+            let query = self.font_query.trim().to_lowercase();
             sync(
-                &models.font_families,
-                self.font_families()
-                    .into_iter()
+                &models.font_matches,
+                families
+                    .iter()
+                    .filter(|family| query.is_empty() || family.to_lowercase().contains(&query))
                     .map(SharedString::from)
                     .collect(),
+            );
+            sync(
+                &models.font_families,
+                families.into_iter().map(SharedString::from).collect(),
             );
         }
         editor.set_inspector_jump_token(self.inspector_jump.0);
@@ -9383,6 +9388,12 @@ impl Studio {
         // what the knob edits.
         let at = place_in(clip, self.playhead);
         let text = clip.text.clone().unwrap_or_default();
+        // Where the family sits in the picker's list; none when nothing on
+        // this machine has it, which the picker shows in red.
+        let family_row = self
+            .font_families()
+            .iter()
+            .position(|family| family.eq_ignore_ascii_case(text.font_family.trim_matches('"')));
         let fill = colour_of(&text.color);
         let stroke = colour_of(&text.stroke_color);
         let plate = colour_of(&text.background);
@@ -9449,11 +9460,9 @@ impl Studio {
             fade_out: clip.fade_out as f32,
             content: text.content.as_str().into(),
             font_family: text.font_family.trim_matches('"').into(),
-            family_row: self
-                .font_families()
-                .iter()
-                .position(|family| family.eq_ignore_ascii_case(text.font_family.trim_matches('"')))
-                .unwrap_or(0) as i32,
+            family_row: family_row.unwrap_or(0) as i32,
+            font_missing: family_row.is_none()
+                && !text.font_family.trim_matches('"').trim().is_empty(),
             font_size: text.font_size as f32,
             font_weight: text.font_weight as f32,
             italic: text.italic,
@@ -9763,28 +9772,40 @@ impl Studio {
         );
 
         // The Text page's presets: the look each card draws its name in.
+        // All of them for the phone's one shelf; on the desktop, Styles
+        // has the Latin ones and Languages, under it, the rest.
+        let cards: Vec<TextPresetData> = self
+            .text_presets
+            .iter()
+            .map(|preset| {
+                let plate = colour_of(&preset.style.background);
+                TextPresetData {
+                    id: preset.id.as_str().into(),
+                    name: preset.name.as_str().into(),
+                    language: preset.language.as_str().into(),
+                    sample: preset.sample.as_str().into(),
+                    family: preset.style.font_family.trim_matches('"').into(),
+                    weight: preset.style.font_weight.round() as i32,
+                    italic: preset.style.italic,
+                    fill: colour_of(&preset.style.color),
+                    plate,
+                    plated: plate.alpha() > 0,
+                    stroke: colour_of(&preset.style.stroke_color),
+                    stroke_width: preset.style.stroke_width as f32,
+                    align: align_of(preset.style.align),
+                }
+            })
+            .collect();
+        let latin = |card: &TextPresetData| card.language.eq_ignore_ascii_case("latin");
         sync(
-            &models.text_presets,
-            self.text_presets
-                .iter()
-                .map(|preset| {
-                    let plate = colour_of(&preset.style.background);
-                    TextPresetData {
-                        id: preset.id.as_str().into(),
-                        name: i18n::preset_name(&preset.id, &preset.name).into(),
-                        family: preset.style.font_family.trim_matches('"').into(),
-                        weight: preset.style.font_weight.round() as i32,
-                        italic: preset.style.italic,
-                        fill: colour_of(&preset.style.color),
-                        plate,
-                        plated: plate.alpha() > 0,
-                        stroke: colour_of(&preset.style.stroke_color),
-                        stroke_width: preset.style.stroke_width as f32,
-                        align: align_of(preset.style.align),
-                    }
-                })
-                .collect(),
+            &models.style_presets,
+            cards.iter().filter(|card| latin(card)).cloned().collect(),
         );
+        sync(
+            &models.language_presets,
+            cards.iter().filter(|card| !latin(card)).cloned().collect(),
+        );
+        sync(&models.text_presets, cards);
 
         // The bin.
         // The Media shelves count the imports; what the editor made is
@@ -9905,6 +9926,8 @@ impl Studio {
             self.speech.sample_detail_rows(self),
         );
         app.set_speech(self.speech.data(self));
+        self.publish_source(app);
+        editor.set_recording(self.voiceover.recording());
 
         let bar = self.menu_bar();
         app.set_app_menu_height(Self::menu_height(&bar));
@@ -10773,6 +10796,47 @@ impl Studio {
             index,
         });
     }
+}
+
+/// The clips a flattened edit makes audible, as playback takes them:
+/// through the exporter's own cut into pieces, so a curve or a reverse
+/// sounds in the window as it will in the file.
+pub(crate) fn audio_specs(clips: &[concat_export::ExportClip]) -> Vec<ClipSpec> {
+    clips
+        .iter()
+        .filter(|clip| {
+            !clip.muted
+                && (clip.kind == concat_export::ClipKind::Audio
+                    || (clip.kind == concat_export::ClipKind::Video
+                        && clip.has_audio.unwrap_or(true)))
+        })
+        // Through the exporter's own cut into pieces, so a curve or a
+        // reverse sounds in the window as it will in the file.
+        .flat_map(concat_export::audio_pieces)
+        .map(|piece| ClipSpec {
+            path: piece.path.to_string_lossy().into_owned(),
+            audio_stream: piece.stream.map(|index| index as u32),
+            start: piece.start,
+            duration: piece.duration,
+            source_start: piece.source_start,
+            volume: piece.volume as f32,
+            volume_curve: piece
+                .volume_curve
+                .keys()
+                .iter()
+                .map(|key| concat_host::playback::GainKey {
+                    at: key.at,
+                    gain: key.value,
+                    ease: [key.ease.x1, key.ease.y1, key.ease.x2, key.ease.y2],
+                })
+                .collect(),
+            fade_in: piece.fade_in,
+            fade_out: piece.fade_out,
+            speed: piece.speed,
+            preserve_pitch: piece.preserve_pitch,
+            chain: piece.filter_chain,
+        })
+        .collect()
 }
 
 #[cfg(test)]
