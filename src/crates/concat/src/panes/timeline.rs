@@ -100,6 +100,12 @@ pub struct TimelinePane {
     /// The lanes' width on screen, in logical pixels; zero until Slint has
     /// said, and then every clip is published.
     pub width: f32,
+    /// A project just opened and the lanes have not yet shown the whole
+    /// cut. Cleared by the first fit, so a later resize keeps the zoom.
+    fit_pending: bool,
+    /// Bumped when a project opens, so the lane stack scrolls back to the
+    /// top. The pane draws that scroll; Rust only says that it should.
+    pub stack_home: i32,
     /// The playhead is held at the middle of the lanes and the cut moves
     /// under it: the phone's timeline, where a finger drags the lanes to
     /// scrub. `scroll_left` is then a fact about the playhead - half a
@@ -120,6 +126,8 @@ impl Default for TimelinePane {
             pan_mode: false,
             lane_view: HashMap::new(),
             width: 0.0,
+            fit_pending: false,
+            stack_home: 0,
             centred: false,
         }
     }
@@ -193,14 +201,40 @@ impl TimelinePane {
                 self.recentre(studio.playhead);
             }
             TimelineMsg::Resized(width) => {
-                self.width = width.max(0.0);
+                self.resized_to(width, studio.duration());
                 self.recentre(studio.playhead);
             }
             TimelineMsg::Reset => {
-                self.scroll_left = 0.0;
                 self.lane_view.clear();
+                self.opened(studio.duration());
                 self.recentre(studio.playhead);
             }
+        }
+    }
+
+    /// A project opened. The view returns to the start of the cut and, once
+    /// the lanes have a width, shows the whole of it. A later resize does
+    /// not fit again: that zoom is the one the tray's buttons then change.
+    fn opened(&mut self, duration: f32) {
+        self.scroll_left = 0.0;
+        self.fit_pending = true;
+        self.stack_home = self.stack_home.wrapping_add(1);
+        self.fit_now(duration);
+    }
+
+    /// The lanes are `width` pixels wide. The first time after [`opened`]
+    /// that the width is real, the cut is fitted; after that only the
+    /// width is kept.
+    fn resized_to(&mut self, width: f32, duration: f32) {
+        self.width = width.max(0.0);
+        self.fit_now(duration);
+    }
+
+    /// Fits the cut when a project open is still waiting on a width.
+    fn fit_now(&mut self, duration: f32) {
+        if self.fit_pending && self.width > 1.0 {
+            self.fit(duration, self.width);
+            self.fit_pending = false;
         }
     }
 
@@ -400,6 +434,37 @@ mod tests {
             "and so does fit"
         );
         assert_eq!(view.scroll_left, 0.0);
+    }
+
+    #[test]
+    fn opening_fits_the_whole_cut_and_a_later_resize_keeps_that_zoom() {
+        let mut view = pane(1000.0, 40.0, 0.05);
+        let duration = 7200.0;
+        view.opened(duration);
+        assert!(
+            view.width * view.seconds_per_pixel >= duration,
+            "{}",
+            view.seconds_per_pixel
+        );
+        assert_eq!(view.scroll_left, 0.0);
+        let zoom = view.seconds_per_pixel;
+        view.resized_to(800.0, duration);
+        assert_eq!(view.seconds_per_pixel, zoom);
+        assert_eq!(view.width, 800.0);
+    }
+
+    #[test]
+    fn a_fit_on_open_waits_until_the_lanes_have_a_width() {
+        let mut view = pane(0.0, 10.0, 0.05);
+        view.opened(120.0);
+        assert!((view.seconds_per_pixel - 0.05).abs() < 1e-6);
+        assert!(view.fit_pending);
+        view.resized_to(500.0, 120.0);
+        assert!(view.width * view.seconds_per_pixel + 1e-3 >= 120.0 * 1.05);
+        assert!(!view.fit_pending);
+        let zoom = view.seconds_per_pixel;
+        view.resized_to(700.0, 120.0);
+        assert_eq!(view.seconds_per_pixel, zoom);
     }
 
     #[test]

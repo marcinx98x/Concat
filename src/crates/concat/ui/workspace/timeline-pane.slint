@@ -186,6 +186,27 @@ export component TimelinePane inherits Rectangle {
     /// The scroll the grid is drawn at: the room over the stack shows at the
     /// top, and scrolled to the end, the same room shows under it.
     property <length> shown-scroll: root.at - root.edge-room;
+    /// Bumped when a project opens, so a stack left scrolled in the previous
+    /// one comes back to the top.
+    in property <int> stack-home;
+    /// The next added lane goes under the stack, so the view follows it
+    /// there. A lane added on top is brought back to the top instead.
+    property <bool> reveal-bottom: false;
+    property <int> lane-count: root.tracks.length;
+
+    changed stack-home => {
+        root.track-scroll = 0px;
+        root.reveal-bottom = false;
+    }
+    // A lane added underneath arrives after the callback, once Rust has
+    // published the taller stack. Following it then, not only inside the
+    // callback, is what puts the new lane on screen.
+    changed lane-count => {
+        if (root.reveal-bottom) {
+            root.track-scroll = root.overflow;
+            root.reveal-bottom = false;
+        }
+    }
 
     // The preview axis button's menu. Hosted here and not in the tray,
     // because the surface a ContextMenu opens into is the element it is:
@@ -363,7 +384,17 @@ export component TimelinePane inherits Rectangle {
             captions => { root.captions(); }
             speak => { root.speak(); }
             record-voiceover => { root.record-voiceover(); }
-            add-track(bottom) => { root.add-track(bottom); }
+            add-track(bottom) => {
+                root.reveal-bottom = bottom;
+                root.add-track(bottom);
+                // The model may already include the lane. Reading overflow
+                // here clamps a bottom add to the end; a top add shows the
+                // new lane, which is drawn first.
+                root.track-scroll = bottom ? root.overflow : 0px;
+                if (!bottom) {
+                    root.reveal-bottom = false;
+                }
+            }
             fit => { root.zoom-to-fit(lanes.width); }
             // No anchor from a button: a wheel zooms about the pointer and a
             // press zooms about the view, since a press has no pointer to

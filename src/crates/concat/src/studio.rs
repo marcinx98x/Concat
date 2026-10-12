@@ -942,6 +942,10 @@ pub struct Studio {
 
     // ── the launch screen ──
     pub on_start: bool,
+    /// Set when a project opens, taken by the next `publish`, which is the
+    /// first moment this window can be asked to fill the screen. A phone
+    /// never sets it: its window is the screen already.
+    present_maximized: std::cell::Cell<bool>,
     pub start: crate::panes::start::StartPane,
     pub recents: Vec<ProjectInfo>,
     pub posters: HashMap<String, slint::Image>,
@@ -2191,6 +2195,7 @@ impl Studio {
             activity_burst: None,
             toast: ToastState::default(),
             on_start: true,
+            present_maximized: std::cell::Cell::new(false),
             start: crate::panes::start::StartPane::default(),
             recents,
             posters: HashMap::new(),
@@ -7755,6 +7760,12 @@ impl Studio {
                     crate::panes::timeline::TimelineMsg::Reset,
                 ));
                 self.on_start = false;
+                // The desk fills the work area the way CapCut's editor does.
+                // A phone's window is already the screen, and `centred` is
+                // how this side of the window knows which it is.
+                if !self.lanes.centred {
+                    self.present_maximized.set(true);
+                }
                 self.handle(crate::panes::Msg::Monitor(
                     crate::panes::monitor::MonitorMsg::Opened,
                 ));
@@ -8279,9 +8290,25 @@ impl Studio {
     // ── publishing ──
 
     pub fn publish(&self, app: &App, models: &Models) {
+        let fill_screen = self.present_maximized.replace(false);
         self.publish_lanes(app, models);
         self.publish_chrome(app, models);
         self.publish_dock(app, models);
+        if fill_screen {
+            let weak = app.as_weak();
+            // This publish dirties the window, and the pass that follows
+            // writes the preferred 1400×900 back over a maximize done now.
+            // The next turn is after that pass.
+            slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                if let Some(app) = weak.upgrade() {
+                    // Slint's own flag, not winit directly: the layout pass
+                    // is what applies it, after the size check, so a preferred
+                    // size cannot put the window back.
+                    app.window().set_maximized(true);
+                    app.set_window_maximized(true);
+                }
+            });
+        }
     }
 
     pub fn publish_dock(&self, _app: &App, models: &Models) {
@@ -8578,6 +8605,7 @@ impl Studio {
         editor.set_scroll_left(self.lanes.scroll_left);
         editor.set_seconds_per_pixel(self.lanes.seconds_per_pixel);
         editor.set_duration_seconds(self.duration());
+        editor.set_stack_home(self.lanes.stack_home);
         editor.set_frame_rate(self.frame_rate());
         editor.set_tool(self.lanes.tool);
         editor.set_snap(self.lanes.snap);

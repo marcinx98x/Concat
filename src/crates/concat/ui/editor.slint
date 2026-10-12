@@ -336,6 +336,8 @@ export global Editor {
     in-out property <float> seconds-per-pixel;
     /// Where the cut ends, in seconds: how far the lanes can scroll to.
     in-out property <float> duration-seconds;
+    /// Bumped when a project opens, so the lane stack scrolls back to the top.
+    in-out property <int> stack-home;
 
     callback tab-selected(index: int);
     callback tab-renamed(index: int, name: string);
