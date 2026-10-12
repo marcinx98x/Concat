@@ -962,6 +962,9 @@ pub struct Studio {
     pub compact: bool,
     pub workspace: (f32, f32),
     pub divider_press: Option<(usize, f32, f32)>,
+    /// The user has dragged a gutter. Until then a resize keeps the
+    /// timeline a lane-gap taller than the default split.
+    split_owned: bool,
     pub gesture: Gesture,
     /// The snap lines of a stage move in flight; empty between moves.
     pub stage_guides: Vec<StageGuideData>,
@@ -2206,6 +2209,7 @@ impl Studio {
             compact: false,
             workspace: (0.0, 0.0),
             divider_press: None,
+            split_owned: false,
             gesture: Gesture::None,
             stage_guides: Vec::new(),
             inspector_jump: (0, "", ""),
@@ -8332,6 +8336,35 @@ impl Studio {
             std::mem::swap(&mut self.dock, &mut self.dock_aside);
             self.compact = compact;
         }
+    }
+
+    /// The timeline is [`crate::dock::TIMELINE_LIFT`] pixels taller than the
+    /// default split, on both arrangements, until a gutter has been dragged.
+    /// Recomputed from the base share so a later resize, the maximise after
+    /// a project opens included, still lands on that many pixels.
+    pub fn lift_timeline(&mut self) {
+        if self.split_owned {
+            return;
+        }
+        let height = self.workspace.1;
+        let (showing, aside) = if self.compact {
+            (
+                crate::dock::COMPACT_TOP_SHARE,
+                crate::dock::DEFAULT_TOP_SHARE,
+            )
+        } else {
+            (
+                crate::dock::DEFAULT_TOP_SHARE,
+                crate::dock::COMPACT_TOP_SHARE,
+            )
+        };
+        crate::dock::lift_timeline(&mut self.dock, showing, height);
+        crate::dock::lift_timeline(&mut self.dock_aside, aside, height);
+    }
+
+    /// A gutter drag from here on is the user's split, not the opening one.
+    pub fn own_split(&mut self) {
+        self.split_owned = true;
     }
 
     pub fn dock_layout(&self) -> DockLayout {

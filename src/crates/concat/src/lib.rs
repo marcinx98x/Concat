@@ -559,6 +559,7 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
         // for the window to widen again; every dock operation works on
         // whichever is showing.
         state.set_compact(width < studio::COMPACT_WIDTH);
+        state.lift_timeline();
     }));
     editor.on_dock_set(on_dock!(|state, seat: i32, kind: PaneKind| {
         let Some(path) = state.dock.leaf_path(seat.max(0) as usize) else {
@@ -664,6 +665,7 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
             1.0 - side(second_narrow) / extent,
         );
         *ratio = (from + delta / extent).clamp(low, high.max(low));
+        state.own_split();
     }));
 
     // ── the bin ──

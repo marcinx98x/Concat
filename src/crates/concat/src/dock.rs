@@ -21,6 +21,14 @@ pub const METERS_MIN_W: f32 = 76.0;
 /// The meters' share of the bottom row in the default layout: a slim
 /// column beside the timeline, at its full height.
 const METERS_SHARE: f32 = 0.055;
+/// The top row's share of a wide window, before the timeline is lifted.
+pub const DEFAULT_TOP_SHARE: f32 = 0.6;
+/// The monitor's share of a narrow window, before the timeline is lifted.
+pub const COMPACT_TOP_SHARE: f32 = 0.5;
+/// The empty ground above the first lane (`edge-room` in the timeline
+/// pane). The timeline opens this much taller, so that ground does not
+/// cost a lane its place on screen.
+pub const TIMELINE_LIFT: f32 = 64.0;
 
 pub enum Dock {
     /// One view, filling its box.
@@ -261,7 +269,7 @@ pub fn lay_out(node: &Dock, (x, y, w, h): (f32, f32, f32, f32), out: &mut DockLa
 pub fn default_dock() -> Dock {
     Dock::Split {
         columns: false,
-        ratio: 0.6,
+        ratio: DEFAULT_TOP_SHARE,
         first: Box::new(Dock::Split {
             columns: true,
             ratio: 0.31,
@@ -291,10 +299,39 @@ pub fn default_dock() -> Dock {
 pub fn compact_dock() -> Dock {
     Dock::Split {
         columns: false,
-        ratio: 0.5,
+        ratio: COMPACT_TOP_SHARE,
         first: Dock::leaf(PaneKind::Preview),
         second: Dock::leaf(PaneKind::Timeline),
     }
+}
+
+/// Gives the timeline [`TIMELINE_LIFT`] pixels more than `base` would, on
+/// a workspace `height` pixels tall. The top row stays at least
+/// [`SEAT_MIN_H`]. Nothing happens when the root split is not the vertical
+/// one, or the workspace is too short to lift.
+pub fn lift_timeline(dock: &mut Dock, base: f32, height: f32) {
+    let usable = height - 3.0 * SEAT_GAP;
+    if usable <= SEAT_MIN_H {
+        return;
+    }
+    let Dock::Split {
+        columns: false,
+        ratio,
+        ..
+    } = dock
+    else {
+        return;
+    };
+    let floor = SEAT_MIN_H / usable;
+    let lifted = base - TIMELINE_LIFT / usable;
+    // Both rows can keep a seat's minimum only while the window is tall
+    // enough for two of them. Shorter, the top row keeps its minimum and
+    // the timeline takes what is left.
+    *ratio = if floor < 0.5 {
+        lifted.clamp(floor, 1.0 - floor)
+    } else {
+        lifted.max(floor).min(1.0)
+    };
 }
 
 pub fn row_top(heights: &[f32], row: i32) -> f32 {
@@ -388,5 +425,35 @@ mod tests {
         assert_eq!(band_rows(&heights, -10.0, 70.0), Some((0, 1)));
         assert_eq!(band_rows(&heights, 115.0, 300.0), Some((2, 2)));
         assert_eq!(band_rows(&[], 0.0, 0.0), None, "no lanes");
+    }
+
+    #[test]
+    fn the_timeline_opens_a_lane_gap_taller() {
+        let height = 900.0;
+        let mut dock = default_dock();
+        lift_timeline(&mut dock, DEFAULT_TOP_SHARE, height);
+        let usable = height - 3.0 * SEAT_GAP;
+        let Dock::Split { ratio, columns, .. } = dock else {
+            panic!("the root is a split");
+        };
+        assert!(!columns);
+        let timeline = usable * (1.0 - ratio);
+        let was = usable * (1.0 - DEFAULT_TOP_SHARE);
+        assert!(
+            (timeline - was - TIMELINE_LIFT).abs() < 1e-3,
+            "{timeline} vs {was}"
+        );
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_top_row_usable() {
+        let height = SEAT_MIN_H + TIMELINE_LIFT + 3.0 * SEAT_GAP + 20.0;
+        let mut dock = default_dock();
+        lift_timeline(&mut dock, DEFAULT_TOP_SHARE, height);
+        let usable = height - 3.0 * SEAT_GAP;
+        let Dock::Split { ratio, .. } = dock else {
+            panic!("the root is a split");
+        };
+        assert!(usable * ratio + 1e-3 >= SEAT_MIN_H, "{ratio}");
     }
 }
