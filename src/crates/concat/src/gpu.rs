@@ -84,13 +84,15 @@ impl Gpu {
         } else {
             format!("{} · {}", info.name, info.backend)
         });
-        // The adapter's own limits, not `Limits::default()`: the defaults are
-        // the downlevel floor every GL-class device can meet, and their
-        // `max_texture_dimension_2d` is 8192 whatever the machine can do -
-        // 16384 on any current desktop GPU. Both sides of this device want
-        // the real number: the monitor composites the timeline's frame, and
-        // Slint's renderer allocates a layer as large as the element it is
-        // flattening.
+        // The adapter's own limits, not `Limits::default()`. The defaults are
+        // WebGPU's baseline, which a Vulkan, Metal or Direct3D 12 GPU meets
+        // and an OpenGL ES one may not - asking for them opened no device
+        // on such phones (#312) - and their `max_texture_dimension_2d` is
+        // 8192 whatever the machine can do: 16384 on any current desktop
+        // GPU. What the adapter reports it can always open, and both sides
+        // of this device want the real number: the monitor composites the
+        // timeline's frame, and Slint's renderer allocates a layer as large
+        // as the element it is flattening.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("concat"),
             required_limits: adapter.limits(),
@@ -103,6 +105,13 @@ impl Gpu {
         device.set_device_lost_callback(|reason, message| {
             log::error!("the window's GPU device was lost ({reason:?}): {message}");
         });
+        // An error no scope caught goes to the log too. wgpu's default
+        // handler panics, and on this device that is the window's thread:
+        // a texture past the limit, asked for by anything that draws on it,
+        // took the app down where a bad frame would do.
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            log::error!("the window's GPU device reported an error: {error}");
+        }));
         Some(Gpu {
             instance,
             adapter,

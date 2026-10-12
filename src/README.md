@@ -67,20 +67,6 @@ dependency pinned: `nix build` (then `./result/bin/concat`), `nix run`, or
 `nix develop` for a shell with the toolchain and libraries in it. Linux
 x86_64 and aarch64.
 
-The crates that carry no native library - `concat-core`, `concat-project`,
-`concat-effects`, `concat-render` (the wgpu compositor included, on WebGPU)
-and `concat-text` - also build for the web, and CI keeps them building:
-
-```sh
-cargo check -p concat-core -p concat-project -p concat-effects -p concat-render -p concat-text \
-    --features concat-render/gpu --target wasm32-unknown-unknown
-```
-
-The rest is native by nature: `concat-media` links FFmpeg, `concat-host`
-talks to the audio device and the file system, `concat-speech` compiles in
-whisper.cpp and sherpa-onnx, and `concat` is a window. `concat-export` goes
-with them for now because its render loop reads through `concat-media`.
-
 ### Phones
 
 The whole engine and the window build for Android (arm64) and iOS
@@ -117,19 +103,6 @@ desktop and on iOS runs it from `main.rs`, `concat-android` from the
 activity's `android_main`, and `crates/concat/src/platform.rs` is where
 the three differ - how the backend is chosen, how files are picked, and
 whether there is a title strip to drag.
-
-## Measuring
-
-`cargo run -p concat-perf --release` prints a table of how fast the parts
-a person waits on are - planning a frame, an undo, opening a document,
-decoding, a scrub through the cache, compositing on the CPU and the GPU,
-an export - each against a budget, on synthetic media so the numbers are
-the machine's and the code's. `--check` fails the run when a scenario is
-outside its budget; `--quick` skips the media, and CI runs the quick set
-that way on every push.
-The quick scenarios also run under `cargo test`, so a regression there
-stops the build. See `crates/concat-perf/src/main.rs` for what each
-number means and what is not measured.
 
 ## Driving Concat without the window
 

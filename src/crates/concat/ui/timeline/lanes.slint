@@ -182,11 +182,14 @@ component Clip inherits Rectangle {
     property <length> chip-w: Math.max(root.chip, 14px);
     property <length> body-h: Math.max(0px, root.height - root.header-h);
     /// The sound band at the foot of a video clip: its file's waveform
-    /// under its frames, a third of the body and never a sliver, and there
-    /// whether or not the file has sound - a silent file shows the empty
-    /// band, so a video that has gone quiet is tellable from one that
-    /// never spoke. https://github.com/jub0t/Concat/issues/137
-    property <bool> banded: root.item.kind == ClipKind.video;
+    /// under its frames, a third of the body and never a sliver. A video
+    /// that has gone quiet - muted, or its sound detached - keeps the
+    /// empty band, so it is tellable from one that never spoke
+    /// (https://github.com/jub0t/Concat/issues/137); a file with no sound
+    /// at all has none, and its frames take the whole body, since a band
+    /// there promised a sound that was never in it.
+    /// https://github.com/jub0t/Concat/issues/283
+    property <bool> banded: root.item.kind == ClipKind.video && root.item.has-audio;
     property <length> band-h: root.banded
         ? Math.clamp(root.body-h * 0.34, 8px, 30px)
         : 0px;
@@ -1469,6 +1472,12 @@ export component Lanes inherits Rectangle {
             // onto every clip would be one more thing to keep in step.
             locked: root.tracks[entry.row].locked;
 
+            // A press is not yet a drag: the edge scroll waits for the
+            // first report of one, which brings the pointer with it. Set
+            // here, with the last drag's pointer still in `pointer-x`, a
+            // click near the lanes' edge scrolled the view and moved the
+            // clip by the last drag's distance.
+            // https://github.com/jub0t/Concat/issues/247
             pressed(additive, edge) => {
                 root.press-scroll = root.scroll-left;
                 root.drag-seconds = 0;

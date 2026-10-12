@@ -287,6 +287,8 @@ export component App inherits Window {
     in property <[string]> caption-models;
     in property <[string]> caption-languages;
     callback captions-closed();
+    callback captions-voice-toggled(on: bool);
+    callback captions-source-changed(index: int);
     callback captions-text-edited(text: string);
     callback captions-model-changed(index: int);
     callback captions-language-changed(index: int);
@@ -829,6 +831,8 @@ export component App inherits Window {
         languages: root.caption-languages;
 
         closed => { root.captions-closed(); }
+        voice-toggled(on) => { root.captions-voice-toggled(on); }
+        source-changed(index) => { root.captions-source-changed(index); }
         text-edited(text) => { root.captions-text-edited(text); }
         model-changed(index) => { root.captions-model-changed(index); }
         language-changed(index) => { root.captions-language-changed(index); }

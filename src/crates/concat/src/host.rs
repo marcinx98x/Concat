@@ -337,6 +337,68 @@ pub fn on_ui_in_project(
     on_ui_gated(Some(epoch), body);
 }
 
+/// Asks a native dialog on the event-loop thread with the studio
+/// unborrowed, and hands its answer to `then` with the studio borrowed,
+/// publishing after. For every file and folder dialog.
+///
+/// A dialog blocks, and on macOS it pumps Slint's timers while it is up;
+/// the transport timer and the meters both `borrow_mut` the studio. A
+/// dialog opened inside a handler, where the studio is already borrowed
+/// for the handler's whole run, was a `BorrowMutError` the moment a timer
+/// fired under it - Export › Browse while playing (audit 2026-10-09,
+/// finding 6). Here `ask` runs on its own turn of the loop before anything
+/// is borrowed, and nothing is published for an answer of `None`: a
+/// cancelled dialog changed nothing.
+pub fn after_dialog<T: Send + 'static>(
+    ask: impl FnOnce() -> Option<T> + Send + 'static,
+    then: impl FnOnce(&mut Studio, &App, &Models, T) + Send + 'static,
+) {
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(answer) = ask() else {
+            return;
+        };
+        Shell::with(|shell, app| {
+            {
+                let mut studio = shell.studio.borrow_mut();
+                then(&mut studio, &app, &shell.models, answer);
+            }
+            shell.studio.borrow().publish(&app, &shell.models);
+        });
+    });
+}
+
+/// [`after_dialog`] for files, on every platform. The desktop's dialog is
+/// asked on a turn of its own with the studio unborrowed. A phone's picker
+/// is another screen, which answers later from whichever thread it likes,
+/// so it is asked the same way and answered through [`on_ui`]. `then` is
+/// not called for a picker dismissed with nothing chosen. `filter` names a
+/// family and its extensions, for the desktop's dialog; a phone's offers
+/// every kind of media on its own.
+pub fn pick_files_then(
+    title: String,
+    filter: Option<(String, &'static [&'static str])>,
+    then: impl FnOnce(&mut Studio, &App, &Models, Vec<std::path::PathBuf>) + Send + 'static,
+) {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        let _ = slint::invoke_from_event_loop(move || {
+            let filter = filter.as_ref().map(|(name, list)| (name.as_str(), *list));
+            crate::platform::pick_files_async(&title, filter, move |paths| {
+                if !paths.is_empty() {
+                    on_ui(move |studio, app, models| then(studio, app, models, paths));
+                }
+            });
+        });
+    } else {
+        after_dialog(
+            move || {
+                let filter = filter.as_ref().map(|(name, list)| (name.as_str(), *list));
+                crate::platform::pick_files(&title, filter)
+            },
+            then,
+        );
+    }
+}
+
 fn on_ui_gated(epoch: Option<u64>, body: impl FnOnce(&mut Studio, &App, &Models) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
         Shell::with(|shell, app| {

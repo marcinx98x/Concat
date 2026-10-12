@@ -893,6 +893,19 @@ pub fn render_on(
             request.rate_num, request.rate_den
         )
     })?;
+    // A frame past what one texture can hold would panic the GPU device at
+    // its first allocation, on this thread; the document and the API hold
+    // their callers to the same ceiling, and the command line reaches here
+    // with nothing in between.
+    let side = 1..=concat_core::frame::MAX_SIDE;
+    if !side.contains(&request.width) || !side.contains(&request.height) {
+        return Err(format!(
+            "{}×{} is not a frame size a video can have; the most is {} a side",
+            request.width,
+            request.height,
+            concat_core::frame::MAX_SIDE
+        ));
+    }
     let output = PathBuf::from(&request.output);
 
     // Transitions become overlaps, ramps and fade filters before anything
@@ -951,9 +964,24 @@ pub fn render_on(
         .file_stem()
         .map_or_else(|| "concat".into(), |s| s.to_string_lossy());
     let directory = output.parent().unwrap_or(Path::new("."));
+    // The folder the file goes in is made when it is not there. A phone's
+    // Movies folder under the app's own files does not exist until the
+    // first export, and every phone's first export stopped at "no such
+    // file or directory" before a frame was drawn (#280, #147).
+    if let Err(error) = std::fs::create_dir_all(directory) {
+        return Err(format!(
+            "could not create the folder {}: {error}",
+            directory.display()
+        ));
+    }
     let silent = directory.join(format!(".{stem}.concat-video.mp4"));
     let mixed = directory.join(format!(".{stem}.concat-audio.m4a"));
+    let muxed = directory.join(format!(".{stem}.concat-muxed.mp4"));
 
+    // The output path is touched once, by the rename at the end, whichever
+    // way the file was made. The mux used to write it directly, and a mux
+    // that failed - the disk full, a read error - left a truncated file
+    // where the previous export had been (audit 2026-10-09, finding 4).
     let result = (|| -> Result<(), String> {
         render_picture(
             request,
@@ -966,24 +994,26 @@ pub fn render_on(
             &mut reporter,
         )?;
 
-        if sound.is_empty() {
-            std::fs::rename(&silent, &output)
-                .map_err(|error| format!("could not write {}: {error}", output.display()))?;
-            return Ok(());
-        }
+        let finished = if sound.is_empty() {
+            &silent
+        } else {
+            reporter.cancelled()?;
+            reporter.emit(0, total_frames, "mixing audio");
+            let mix: Vec<AudioClip> = sound.iter().flat_map(|clip| audio_pieces(clip)).collect();
+            audio::mix_to_file(&mix, timeline_end, &mixed).map_err(|error| error.to_string())?;
 
-        reporter.cancelled()?;
-        reporter.emit(0, total_frames, "mixing audio");
-        let mix: Vec<AudioClip> = sound.iter().flat_map(|clip| audio_pieces(clip)).collect();
-        audio::mix_to_file(&mix, timeline_end, &mixed).map_err(|error| error.to_string())?;
-
-        reporter.cancelled()?;
-        reporter.emit(total_frames, total_frames, "muxing");
-        audio::mux(&silent, &mixed, &output).map_err(|error| error.to_string())
+            reporter.cancelled()?;
+            reporter.emit(total_frames, total_frames, "muxing");
+            audio::mux(&silent, &mixed, &muxed).map_err(|error| error.to_string())?;
+            &muxed
+        };
+        std::fs::rename(finished, &output)
+            .map_err(|error| format!("could not write {}: {error}", output.display()))
     })();
 
     let _ = std::fs::remove_file(&silent);
     let _ = std::fs::remove_file(&mixed);
+    let _ = std::fs::remove_file(&muxed);
 
     result.map(|()| output.to_string_lossy().into_owned())
 }
@@ -1163,9 +1193,21 @@ fn best_compositor() -> Result<WgpuCompositor, String> {
 }
 
 /// What an export or a preview says on a machine that offers no GPU and no
-/// software renderer either.
-const NO_RENDERER: &str = "no GPU or software renderer is available to draw with - on Linux, \
-     install Mesa's Vulkan drivers (lavapipe)";
+/// software renderer either: on Linux, where the software renderer is a
+/// package away, which package.
+#[cfg(target_os = "linux")]
+const NO_RENDERER: &str = "no GPU or software renderer is available to draw with - install \
+     Mesa's Vulkan drivers (lavapipe)";
+
+/// On a phone there is nothing to install: the one GPU it has would not
+/// open, and the log says which and why (#312).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const NO_RENDERER: &str = "this device's GPU could not be used to draw with";
+
+/// Elsewhere the platform's own software renderer is always there, so
+/// this is a machine whose GPU and fallback both refused.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
+const NO_RENDERER: &str = "no GPU or software renderer is available to draw with";
 
 /// How many times an export's device may die under it before the export
 /// gives up: the first death is answered with a fresh device on the GPU,
@@ -1182,12 +1224,16 @@ const DEVICE_LOSSES: u32 = 3;
 /// command takes too long, and a card shared with the window, the hardware
 /// decoder and the encoder can run out of memory. Both ended the export
 /// with "the GPU device was lost" on 8 GB NVIDIA cards (#223); the frames
-/// already encoded are kept and the next is drawn on the new device.
+/// already encoded are kept and the next is drawn on the new device. A
+/// device that stops answering for [`concat_render::gpu::DEVICE_WAIT`], or
+/// reports an error under a frame, counts as lost too (#297).
 fn recovered(losses: u32, hdr: bool) -> Result<WgpuCompositor, String> {
     if losses >= DEVICE_LOSSES {
         return Err(format!(
-            "the GPU device was lost {losses} times part way through the export; nothing \
-             on this machine can draw it to the end"
+            "the GPU device was lost {losses} times part way through the export - reset, \
+             out of memory, or not answering for {} seconds; nothing on this machine can \
+             draw it to the end",
+            concat_render::gpu::DEVICE_WAIT.as_secs()
         ));
     }
     let fresh = if losses == 1 {
@@ -1215,11 +1261,36 @@ fn recovered(losses: u32, hdr: bool) -> Result<WgpuCompositor, String> {
 fn headless<T>(draw: impl FnOnce(&mut WgpuCompositor) -> T) -> Result<T, String> {
     static HEADLESS: std::sync::OnceLock<Option<std::sync::Mutex<WgpuCompositor>>> =
         std::sync::OnceLock::new();
+    // A machine with nothing to draw on stays so for the process; why is
+    // in the log above this line, adapter by adapter.
     let slot = HEADLESS
-        .get_or_init(|| WgpuCompositor::new().map(std::sync::Mutex::new))
+        .get_or_init(|| {
+            let made = WgpuCompositor::new();
+            match &made {
+                Some(gpu) => {
+                    let adapter = gpu.adapter_info();
+                    log::info!(
+                        "previews draw on {} ({:?}, {:?})",
+                        adapter.name,
+                        adapter.device_type,
+                        adapter.backend
+                    );
+                }
+                None => log::error!("previews have nothing to draw on: {NO_RENDERER}"),
+            }
+            made.map(std::sync::Mutex::new)
+        })
         .as_ref()
         .ok_or_else(|| NO_RENDERER.to_owned())?;
     let mut gpu = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A device that died under an earlier preview is not kept: every
+    // preview after it would be black.
+    if gpu.lost()
+        && let Some(fresh) = WgpuCompositor::new()
+    {
+        log::warn!("previews: the GPU device was lost; drawing on a fresh one");
+        *gpu = fresh;
+    }
     Ok(draw(&mut gpu))
 }
 
@@ -1247,6 +1318,15 @@ fn render_picture(
         adapter.device_type,
         adapter.backend
     );
+    // The request was held to the document's ceiling; a phone's GPU can
+    // hold less, and a frame past it is said here rather than failed on.
+    let most = compositor.max_side();
+    if request.width > most || request.height > most {
+        return Err(format!(
+            "{}×{} is more than {} can draw; the most it takes is {most} a side",
+            request.width, request.height, adapter.name
+        ));
+    }
     let BuiltTimeline {
         timeline,
         stills,
@@ -1295,6 +1375,8 @@ fn render_picture(
 
     // How many devices have died under this export so far; see `recovered`.
     let mut losses = 0;
+    // When progress was last said; see `progress_due`.
+    let mut said = std::time::Instant::now();
 
     // One decoder per clip, opened at its in-point the first time the clip is
     // needed and dropped the moment it leaves the playhead. Every decoder is
@@ -1320,32 +1402,39 @@ fn render_picture(
                     .get(&layer.clip)
                     .copied()
                     .unwrap_or((request.width, request.height));
-                if let Ok(frame) = sought.frame_at(
-                    &layer.media,
-                    layer.source_time,
-                    decode_width,
-                    decode_height,
-                    stills.contains(&layer.clip),
-                    None,
-                    None,
-                    ranges.get(&layer.clip).copied(),
-                    // Deep where the frame goes to the GPU as it is: a
-                    // cutout cuts eight bits.
-                    !cutouts.contains_key(&layer.clip),
-                ) {
-                    let frame = cutouts
-                        .get(&layer.clip)
-                        .and_then(|job| job.cut(&frame, layer.source_time))
-                        .map_or(frame, std::sync::Arc::new);
-                    layers.push(filled(
-                        layer,
-                        frame,
-                        tracks.get(&layer.clip).copied().unwrap_or(0),
-                        passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
-                        geometry.get(&layer.clip),
-                        shapes_at(&shapes, layer, time, rate),
-                    ));
-                }
+                // A frame that cannot be read ends the export with the
+                // reason, as it does on the paced path below. A time past
+                // the media's end is not that: the pool answers it with the
+                // last frame. This path used to drop a failed frame on the
+                // floor, so a reversed or retimed clip whose file had gone
+                // bad exported as a missing layer and nobody was told.
+                let frame = sought
+                    .frame_at(
+                        &layer.media,
+                        layer.source_time,
+                        decode_width,
+                        decode_height,
+                        stills.contains(&layer.clip),
+                        None,
+                        None,
+                        ranges.get(&layer.clip).copied(),
+                        // Deep where the frame goes to the GPU as it is: a
+                        // cutout cuts eight bits.
+                        !cutouts.contains_key(&layer.clip),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let frame = cutouts
+                    .get(&layer.clip)
+                    .and_then(|job| job.cut(&frame, layer.source_time))
+                    .map_or(frame, std::sync::Arc::new);
+                layers.push(filled(
+                    layer,
+                    frame,
+                    tracks.get(&layer.clip).copied().unwrap_or(0),
+                    passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
+                    geometry.get(&layer.clip),
+                    shapes_at(&shapes, layer, time, rate),
+                ));
                 continue;
             }
             let decoder = match decoders.entry(layer.clip) {
@@ -1459,12 +1548,27 @@ fn render_picture(
         let live: Vec<ClipId> = plan.layers.iter().map(|layer| layer.clip).collect();
         decoders.retain(|clip, _| live.contains(clip));
 
-        if index % 15 == 0 {
+        if progress_due(index, said.elapsed()) {
             reporter.emit(index, total_frames, "rendering");
+            said = std::time::Instant::now();
         }
     }
 
     encoder.finish().map_err(|error| error.to_string())
+}
+
+/// How many frames apart an export says how far it has got, at most.
+const PROGRESS_FRAMES: i64 = 15;
+
+/// And how long it goes without saying, at most, frame time allowing: a
+/// frame that takes seconds - a heavy stack, a software adapter, a card
+/// near its memory - shows as a bar that moves slowly rather than one that
+/// sat still for fifteen of them and looked hung (#297).
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the frame at `index` is one to report, `since` the last report.
+fn progress_due(index: i64, since: std::time::Duration) -> bool {
+    index % PROGRESS_FRAMES == 0 || since >= PROGRESS_INTERVAL
 }
 
 /// The shader passes for one clip at one instant: every keyed knob at its
@@ -2453,6 +2557,199 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A still keeps its own shape on the monitor: a portrait photograph
+    /// in a square frame stands in the middle with the stage either side
+    /// of it, not stretched across the frame (#229). Skips without FFmpeg.
+    #[test]
+    fn a_still_keeps_its_shape_on_the_monitor() {
+        use concat_core::frame::Frame;
+
+        let path = std::env::temp_dir().join("concat-preview-still-test.jpg");
+        let mut tall = Frame::black(32, 64);
+        tall.fill([200, 30, 30, 255]);
+        let Ok(bytes) = concat_media::jpeg(&tall, 90) else {
+            return; // no ffmpeg here
+        };
+        std::fs::write(&path, bytes).expect("writes the still");
+
+        let mut still = clip("image", 0, 0.0, 1.0, 0.0);
+        still.path = path.to_string_lossy().into_owned();
+        still.media_width = Some(32);
+        still.media_height = Some(64);
+        let request = PreviewFrameRequest {
+            time: 0.5,
+            width: 64,
+            height: 64,
+            rate_num: 30,
+            rate_den: 1,
+            clips: vec![still],
+            color_space: concat_project::model::ColorSpace::Sdr,
+        };
+
+        let pool = concat_media::ReaderPool::new(16 * 1024 * 1024, 2);
+        let bytes = preview_frame(&pool, &request).expect("previews a still");
+        assert_eq!(bytes.len(), 64 * 64 * 4);
+        let at = |x: usize, y: usize| {
+            let index = (y * 64 + x) * 4;
+            [bytes[index], bytes[index + 1], bytes[index + 2]]
+        };
+        let centre = at(32, 32);
+        assert!(
+            centre[0] > 120 && centre[1] < 90,
+            "the still is drawn in the middle, got {centre:?}"
+        );
+        for x in [2, 61] {
+            let edge = at(x, 32);
+            assert!(
+                edge[0] < 90,
+                "the stage shows either side of a portrait still, got {edge:?} at x={x}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The folder the file goes in is made by the export: a phone's
+    /// Movies folder does not exist until the first export (#280).
+    #[test]
+    fn an_export_makes_the_folder_it_writes_into() {
+        use concat_core::frame::Frame;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+
+        let root = std::env::temp_dir().join(format!(
+            "concat-export-folder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        let source = std::env::temp_dir().join("concat-export-folder-source.mp4");
+        let Ok(mut encoder) = Encoder::create(
+            &source,
+            64,
+            64,
+            FrameRate::THIRTY,
+            &EncodeOptions::default(),
+        ) else {
+            return; // no ffmpeg here
+        };
+        for _ in 0..6 {
+            encoder.write_frame(&Frame::black(64, 64)).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+
+        let mut footage = clip("video", 0, 0.0, 0.2, 0.0);
+        footage.path = source.to_string_lossy().into_owned();
+        footage.media_width = Some(64);
+        footage.media_height = Some(64);
+        let nested = root.join("Movies").join("Concat");
+        let request = ExportRequest {
+            output: nested.join("out.mp4").to_string_lossy().into_owned(),
+            width: 64,
+            height: 64,
+            rate_num: 30,
+            rate_den: 1,
+            crf: 30,
+            preset: "ultrafast".into(),
+            codec: VideoCodec::H264,
+            ten_bit: false,
+            rate_mode: RateMode::Vbr,
+            bitrate_kbps: 0,
+            color_range: concat_media::ColorRange::Limited,
+            color_space: ColorSpace::Sdr,
+            hdr: false,
+            clips: vec![footage],
+        };
+        assert!(!nested.exists());
+        let cancel = AtomicBool::new(false);
+        let mut progress = |_: i64, _: i64, _: &'static str| {};
+        let reporter = Reporter {
+            progress: &mut progress,
+            cancel: &cancel,
+        };
+        // Whether or not this machine can draw the frames, the folder is
+        // there before the first one is asked for.
+        let result = render_on(&request, None, reporter);
+        assert!(nested.is_dir(), "the export makes its folder: {result:?}");
+        if result.is_ok() {
+            assert!(nested.join("out.mp4").is_file());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// A compositor that fails a frame - one the device refused, or did not
+    /// finish within `DEVICE_WAIT` - does not hang the export or end it:
+    /// the frame is drawn again on a fresh device and the file is written
+    /// (#297). Lent dead, so its first frame is a failed one.
+    #[test]
+    fn an_export_goes_on_past_a_failed_frame() {
+        use concat_core::frame::Frame;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+
+        let Some(mut failing) = WgpuCompositor::new() else {
+            return; // nothing to draw on here
+        };
+        // Wider than any GPU makes a texture.
+        let mut wide = Frame::transparent(1 << 17, 2);
+        wide.fill([255, 255, 255, 255]);
+        failing.render(&FramePlan {
+            layers: vec![PlannedLayer::picture(
+                concat_render::detached_clip(),
+                Arc::new(wide),
+            )],
+            ..FramePlan::empty(16, 16)
+        });
+        assert!(failing.lost(), "the refused frame failed");
+
+        let dir = std::env::temp_dir().join(format!("concat-export-failed-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let source = dir.join("source.mp4");
+        let Ok(mut encoder) = Encoder::create(
+            &source,
+            64,
+            64,
+            FrameRate::THIRTY,
+            &EncodeOptions::default(),
+        ) else {
+            return; // no ffmpeg here
+        };
+        for _ in 0..6 {
+            encoder.write_frame(&Frame::black(64, 64)).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+        let mut footage = clip("video", 0, 0.0, 0.2, 0.0);
+        footage.path = source.to_string_lossy().into_owned();
+        footage.media_width = Some(64);
+        footage.media_height = Some(64);
+        let output = dir.join("out.mp4");
+        let request = ExportRequest {
+            output: output.to_string_lossy().into_owned(),
+            width: 64,
+            height: 64,
+            rate_num: 30,
+            rate_den: 1,
+            crf: 30,
+            preset: "ultrafast".into(),
+            codec: VideoCodec::H264,
+            ten_bit: false,
+            rate_mode: RateMode::Vbr,
+            bitrate_kbps: 0,
+            color_range: concat_media::ColorRange::Limited,
+            color_space: ColorSpace::Sdr,
+            hdr: false,
+            clips: vec![footage],
+        };
+        let cancel = AtomicBool::new(false);
+        let mut progress = |_: i64, _: i64, _: &'static str| {};
+        let reporter = Reporter {
+            progress: &mut progress,
+            cancel: &cancel,
+        };
+        let result = render_on(&request, Some(failing), reporter);
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("the export goes on on a fresh device");
+    }
+
     /// A device that dies under an export is replaced: first by a fresh
     /// one on the GPU, then by the software adapter; the third death ends
     /// the export with a message that says how many there were.
@@ -2462,9 +2759,37 @@ mod tests {
             panic!("a third loss gives up");
         };
         assert!(error.contains("lost 3 times"), "{error}");
+        assert!(error.contains("not answering"), "{error}");
         if WgpuCompositor::new().is_some() {
             let fresh = recovered(1, true).expect("a machine that draws opens another device");
             assert!(!fresh.lost());
+        }
+    }
+
+    /// A slow export still moves: a frame that took over a second is
+    /// reported whatever its number, and a fast one every fifteen frames
+    /// as before.
+    #[test]
+    fn a_slow_export_reports_every_second() {
+        let quick = std::time::Duration::from_millis(30);
+        assert!(progress_due(0, quick));
+        assert!(!progress_due(1, quick));
+        assert!(progress_due(15, quick));
+        assert!(progress_due(1, std::time::Duration::from_millis(1200)));
+        assert!(progress_due(7, PROGRESS_INTERVAL));
+    }
+
+    /// Only Linux is told to install a software renderer: a phone has
+    /// nothing to install, and Windows and macOS have theirs built in.
+    #[test]
+    fn the_no_renderer_advice_fits_the_platform() {
+        assert_eq!(
+            NO_RENDERER.contains("lavapipe"),
+            cfg!(target_os = "linux"),
+            "{NO_RENDERER}"
+        );
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            assert!(NO_RENDERER.contains("GPU could not be used"));
         }
     }
 

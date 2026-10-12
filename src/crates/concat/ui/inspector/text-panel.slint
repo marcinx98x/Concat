@@ -224,7 +224,8 @@ export component TextPanel inherits VerticalLayout {
                     // Every keystroke goes to the echo so the monitor shows
                     // the words as they are typed; the commit waits for the
                     // way out, so a title being typed is one change and not
-                    // forty.
+                    // forty. The keystrokes reach the title they were typed
+                    // for, since the selection cannot change under a key.
                     edited => {
                         self.typed-for = root.selected.id;
                         root.set-text(ClipTextField.content, self.text);

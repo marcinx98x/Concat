@@ -54,9 +54,13 @@ pub enum ExportMsg {
     Again,
     /// Pick the destination folder.
     Browse,
+    /// The folder the picker answered with.
+    FolderChosen(String),
     /// Show the finished file in the file manager.
     Reveal,
     Start,
+    /// Start over a file already there: the confirmation sheet's answer.
+    Overwrite,
     Cancel,
     /// The render's worker reporting where it is.
     Progress {
@@ -67,6 +71,9 @@ pub enum ExportMsg {
     },
     /// The render's worker is done: the file written, or why not.
     Finished(Result<String, String>),
+    /// The phone has moved the file to where it shows it - the path under
+    /// the phone's storage - or could not, and the file is where it was.
+    Published(Result<String, String>),
 }
 
 /// The export sheet's state.
@@ -184,13 +191,21 @@ impl ExportPane {
                 self.phase = ExportPhase::Idle;
                 self.progress = 0.0;
             }
+            // The picker runs with the studio unborrowed and answers as a
+            // message of its own; see `host::after_dialog`.
             ExportMsg::Browse => {
-                if let Some(folder) =
-                    platform::pick_folder(&i18n::t("export.exportTo"), &self.folder)
-                {
-                    self.folder = folder.to_string_lossy().into_owned();
-                }
+                let title = i18n::t("export.exportTo");
+                let current = self.folder.clone();
+                crate::host::after_dialog(
+                    move || platform::pick_folder(&title, &current),
+                    |studio, _, _, folder| {
+                        studio.handle(Msg::Export(ExportMsg::FolderChosen(
+                            folder.to_string_lossy().into_owned(),
+                        )));
+                    },
+                );
             }
+            ExportMsg::FolderChosen(folder) => self.folder = folder,
             ExportMsg::Reveal => {
                 if !self.written.is_empty()
                     && let Err(error) = platform::reveal(&self.written)
@@ -199,6 +214,7 @@ impl ExportPane {
                 }
             }
             ExportMsg::Start => self.start(studio),
+            ExportMsg::Overwrite => self.begin(studio, true),
             ExportMsg::Cancel => {
                 studio.host.exporter.cancel();
                 self.phase = ExportPhase::Idle;
@@ -213,8 +229,25 @@ impl ExportPane {
             ExportMsg::Finished(Ok(written)) => {
                 self.phase = ExportPhase::Done;
                 self.progress = 1.0;
-                self.written = written;
+                self.written = written.clone();
+                // A phone moves the file to where its gallery shows it, and
+                // the sheet says "finished" once it is there.
+                let handed = platform::publish_export(written.into(), |result| {
+                    on_ui(move |studio, _, _| {
+                        studio.handle(Msg::Export(ExportMsg::Published(result)));
+                    });
+                });
+                if !handed {
+                    studio.notify(&t("export.exportFinished"), false);
+                }
+            }
+            ExportMsg::Published(Ok(path)) => {
+                self.written = path;
                 studio.notify(&t("export.exportFinished"), false);
+            }
+            ExportMsg::Published(Err(error)) => {
+                let folder = platform::published_folder().unwrap_or_default();
+                studio.notify(&tf("export.couldNotPublish", &[&folder, &error]), true);
             }
             ExportMsg::Finished(Err(error)) => {
                 if self.phase == ExportPhase::Idle {
@@ -386,14 +419,38 @@ impl ExportPane {
         }
     }
 
-    /// Starts the render on a worker. Its reports come back as messages.
+    /// Starts the render on a worker, once the name is a file's and no
+    /// file is already there; its reports come back as messages.
     fn start(&mut self, studio: &mut Studio) {
-        let Some(session) = studio.session.as_ref() else {
+        self.begin(studio, false);
+    }
+
+    /// [`ExportPane::start`], with `overwrite` saying the person has
+    /// answered the sheet that asked about the file already there.
+    fn begin(&mut self, studio: &mut Studio, overwrite: bool) {
+        if studio.session.is_none() {
             return;
-        };
+        }
         if studio.timeline().clips.is_empty() {
             self.phase = ExportPhase::Failed;
             self.message = t("export.nothingTimelineExport");
+            return;
+        }
+        // The name is a file's, or the sheet says what is wrong with it: an
+        // empty one wrote a hidden `.mp4`, and a slash made folders (audit
+        // 2026-10-09, finding 7).
+        let Some(name) = file_name(&self.name) else {
+            self.phase = ExportPhase::Failed;
+            self.message = t("export.nameNeedsToBeAFileName");
+            return;
+        };
+        let output = format!("{}/{name}.mp4", self.folder.trim_end_matches('/'));
+        // A file already there is replaced once the person has said so:
+        // the confirmation sheet asks, and its answer comes back as
+        // `Overwrite`. Nothing is written until then; the engine renders
+        // beside the file and renames over it at the end.
+        if !overwrite && std::path::Path::new(&output).exists() {
+            studio.confirm = Some(crate::studio::Confirm::ReplaceExport { path: output });
             return;
         }
         let job = match studio.host.exporter.begin() {
@@ -404,11 +461,9 @@ impl ExportPane {
                 return;
             }
         };
-        let output = format!(
-            "{}/{}.mp4",
-            self.folder.trim_end_matches('/'),
-            self.name.trim()
-        );
+        let Some(session) = studio.session.as_ref() else {
+            return;
+        };
         let spec = ExportSpec {
             output: output.clone(),
             crf: EXPORT_CRF[self.quality.min(2)],
@@ -498,7 +553,18 @@ impl ExportPane {
         ExportData {
             open: self.open,
             name: self.name.as_str().into(),
-            path: format!("{}/{}.mp4", self.folder.trim_end_matches('/'), self.name).into(),
+            // Where the file ends up: on a phone, the folder its gallery
+            // shows, not the app's own that the export writes into.
+            // The name as it will be written: trimmed, as `begin` trims it.
+            path: match platform::published_folder() {
+                Some(folder) => format!("{folder}/{}.mp4", self.name.trim()),
+                None => format!(
+                    "{}/{}.mp4",
+                    self.folder.trim_end_matches('/'),
+                    self.name.trim()
+                ),
+            }
+            .into(),
             format: format!("{width} × {height} · {rate:.2} fps").into(),
             duration: {
                 let whole = studio.duration().max(0.0) as i32;
@@ -628,9 +694,38 @@ impl ExportPane {
     }
 }
 
+/// The typed name as the file's, or `None` for one that cannot be: empty
+/// once trimmed, a dot or two, or holding a character no file system
+/// here takes. The set is Windows' - a slash and a backslash, the colon,
+/// the quote and the wildcards, the angle brackets and the bar - on every
+/// platform, so a project's export is named the same wherever it is
+/// opened; a control character is refused with them.
+fn file_name(typed: &str) -> Option<String> {
+    let name = typed.trim();
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        return None;
+    }
+    let refused = |c: char| c.is_control() || r#"/\:*?"<>|"#.contains(c);
+    (!name.chars().any(refused)).then(|| name.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name is a file's or the export does not start: trimmed, never
+    /// empty, never a path, and none of the characters Windows refuses.
+    #[test]
+    fn the_file_name_is_a_file_name() {
+        assert_eq!(file_name("  My cut "), Some("My cut".to_owned()));
+        assert_eq!(file_name("cut.final"), Some("cut.final".to_owned()));
+        assert_eq!(file_name("Ünïcödé 日本"), Some("Ünïcödé 日本".to_owned()));
+        for bad in [
+            "", "   ", ".", "..", "a/b", r"a\b", "c:d", "a?b", "<a>", "a|b", "a\"b", "a*", "a\tb",
+        ] {
+            assert_eq!(file_name(bad), None, "{bad:?}");
+        }
+    }
 
     /// The timeline's rate leads the list and is not offered twice; the
     /// NTSC fractions keep their camera names.

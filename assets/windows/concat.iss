@@ -5,8 +5,8 @@
 ; person double-clicks, and it puts Concat in the Start menu and can take
 ; it out again. Everything it needs is handed in on the command line:
 ;
-;   iscc /DVersion=0.2.6 /DArch=x64compatible /DSuffix=x86_64 ^
-;        /DStage=C:\...\stage\Concat-0.2.6-windows-x86_64 /DOut=C:\...\stage ^
+;   iscc /DVersion=0.2.7 /DArch=x64compatible /DSuffix=x86_64 ^
+;        /DStage=C:\...\stage\Concat-0.2.7-windows-x86_64 /DOut=C:\...\stage ^
 ;        assets\windows\concat.iss
 ;
 ; Arch is Inno's own word for the machine: x64compatible for the x86_64
@@ -63,9 +63,17 @@ PrivilegesRequiredOverridesAllowed=dialog
 ShowLanguageDialog=auto
 
 [Languages]
-; The app's languages that Inno Setup ships an official translation for.
-; Chinese, Persian, Croatian and Korean are not among them, and a setup in
-; those asks which language to use.
+; Every language the app ships. Inno Setup carries the official
+; translations. The ones it keeps as unofficial - Chinese, Persian,
+; Croatian, Bengali, Hindi, Indonesian, Urdu, Vietnamese - and the ones
+; made official lately - Korean, Arabic and Thai, which an older compiler
+; lacks - are vendored in languages/ from the Inno Setup 6.7.1 tree
+; (https://github.com/jrsoftware/issrc/tree/is-6_7_1/Files/Languages),
+; verbatim, so the setup offers them whatever the compiler on the build
+; machine ships (#277). Some are in an older format, which the compiler
+; still reads with the newer messages in English and a warning for each:
+; Traditional Chinese 6.1, Urdu 6.1, Indonesian 6.4, and Bengali and Hindi
+; 5.5.3, whose obsolete title and copyright font sizes it ignores.
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -75,6 +83,22 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "turkish"; MessagesFile: "compiler:Languages\Turkish.isl"
+Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
+Name: "chinesetraditional"; MessagesFile: "languages\ChineseTraditional.isl"
+Name: "korean"; MessagesFile: "languages\Korean.isl"
+Name: "croatian"; MessagesFile: "languages\Croatian.isl"
+Name: "farsi"; MessagesFile: "languages\Farsi.isl"
+Name: "dutch"; MessagesFile: "compiler:Languages\Dutch.isl"
+Name: "hebrew"; MessagesFile: "compiler:Languages\Hebrew.isl"
+Name: "polish"; MessagesFile: "compiler:Languages\Polish.isl"
+Name: "ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl"
+Name: "arabic"; MessagesFile: "languages\Arabic.isl"
+Name: "thai"; MessagesFile: "languages\Thai.isl"
+Name: "bengali"; MessagesFile: "languages\Bengali.islu"
+Name: "hindi"; MessagesFile: "languages\Hindi.islu"
+Name: "indonesian"; MessagesFile: "languages\Indonesian.isl"
+Name: "urdu"; MessagesFile: "languages\Urdu.isl"
+Name: "vietnamese"; MessagesFile: "languages\Vietnamese.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
