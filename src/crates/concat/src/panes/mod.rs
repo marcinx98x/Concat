@@ -18,6 +18,7 @@ pub mod captions;
 pub mod export;
 pub mod media_bin;
 pub mod monitor;
+pub mod pace;
 pub mod project;
 pub mod relink;
 pub mod settings;
@@ -80,10 +81,7 @@ pub fn activity(msg: &Msg) -> Option<Activity> {
             | TimelineMsg::Resized(_),
         )
         | Msg::Export(ExportMsg::Progress { .. })
-        | Msg::Captions(CaptionsMsg::Report(
-            concat_speech::transcribe::Report::Progress(_)
-            | concat_speech::transcribe::Report::Heard { .. },
-        ))
+        | Msg::Captions(CaptionsMsg::Progress(_))
         | Msg::Speech(SpeechMsg::Progress(_))
         | Msg::Settings(SettingsMsg::ModelProgress { .. } | SettingsMsg::InstallProgress { .. }) => {
             return None;
