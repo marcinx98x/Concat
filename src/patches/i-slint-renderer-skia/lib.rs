@@ -745,6 +745,12 @@ impl SkiaRenderer {
         self.path_cache.clear_cache_if_scale_factor_changed(window);
         self.box_shadow_cache.clear_cache_if_scale_factor_changed(window);
 
+        // ClearType is a Windows desk setting, read beside the swapchain
+        // surface. Anywhere else the text stays greyscale.
+        #[cfg(all(feature = "wgpu-30", target_family = "windows"))]
+        let lcd = wgpu_30_surface::window_text_is_lcd();
+        #[cfg(not(all(feature = "wgpu-30", target_family = "windows")))]
+        let lcd = false;
         let mut skia_item_renderer = itemrenderer::SkiaItemRenderer::new(
             skia_canvas,
             window,
@@ -754,6 +760,7 @@ impl SkiaRenderer {
             &self.path_cache,
             &self.text_layout_cache,
             &self.box_shadow_cache,
+            lcd,
         );
 
         let scale_factor = ScaleFactor::new(window_inner.scale_factor());
