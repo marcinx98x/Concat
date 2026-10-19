@@ -321,9 +321,11 @@ impl SettingsPane {
             SettingsMsg::ProxiesChanged(on) => {
                 studio.prefs.proxies = on;
                 studio.prefs.save(&studio.host.dirs);
-                // On, the media already in the project gets its proxies
-                // straight away (refresh_art's stamp holds the switch);
-                // off, playback reads the files from the next frame.
+                // On, re-queue proxies for media already in the project.
+                // Off, playback reads the originals from the next frame.
+                if on {
+                    studio.requeue_proxies();
+                }
             }
             SettingsMsg::GpuChanged(on) => {
                 studio.prefs.software_gpu = !on;

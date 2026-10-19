@@ -21,7 +21,7 @@ const FILE: &str = "settings.json";
 pub const UI_SCALES: [u32; 6] = [100, 110, 125, 150, 175, 200];
 
 /// Remembered preferences.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
     /// The dark theme. `None` is the app's default, which is dark.
@@ -64,12 +64,11 @@ pub struct Preferences {
     /// it is put. Off by default: a click past the last clip lands there, so
     /// a clip can be dropped at the playhead beyond everything else.
     pub playhead_stops_at_end: bool,
-    /// Proxies: a file larger than HD gets a smaller copy written in the
-    /// background, and playback at Half and Quarter reads that copy. Off
-    /// by default, as in CapCut: a proxy is a full re-encode of every large
-    /// file, on the CPU of a phone or through a hardware encoder a laptop
-    /// may not take (an HDR one opened NVENC first), and the person who
-    /// wants one for smoother playback turns it on in Settings.
+    /// Proxies: a file at HD or larger gets a smaller copy written in the
+    /// background, and playback at Half and Quarter reads that copy. On by
+    /// default (CapCut-style Performance): smoother scrubbing of 1080p
+    /// WEB-DL without touching export, which always uses the original.
+    /// Turn off in Settings for a sharper WYSIWYG preview or to spare disk.
     pub proxies: bool,
     /// Drawing in software: the window and the compositor on the
     /// platform's software rasteriser (WARP, lavapipe) instead of the GPU.
@@ -153,6 +152,39 @@ impl Default for VoiceoverPrefs {
             mute: true,
             gain_db: 0.0,
             prompt_speed: 1,
+        }
+    }
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            dark: None,
+            last_project_location: None,
+            accent: None,
+            playhead: None,
+            ui_scale: None,
+            transcriber_model: None,
+            captions_language: None,
+            tts_model: None,
+            tts_voice: None,
+            locale: None,
+            favourites: Vec::new(),
+            playhead_stops_at_end: false,
+            proxies: true,
+            software_gpu: false,
+            magnetic: false,
+            trim_follow: false,
+            preview_axis: false,
+            preview_axis_audio: false,
+            vu_meters: None,
+            download_source: None,
+            download_base: None,
+            server: ServerPrefs::default(),
+            title_style: None,
+            log_level: None,
+            voiceover: VoiceoverPrefs::default(),
+            keybinds: BTreeMap::new(),
         }
     }
 }
@@ -278,6 +310,18 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxies_are_on_by_default_like_capcut_performance() {
+        assert!(Preferences::default().proxies);
+        // A missing field in an otherwise empty settings file uses Default.
+        let prefs: Preferences = serde_json::from_str("{}").expect("empty object");
+        assert!(prefs.proxies);
+        // An explicit off in a saved profile must stick.
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"proxies":false}"#).expect("explicit off");
+        assert!(!prefs.proxies);
+    }
 
     #[test]
     fn the_last_project_location_survives_loading_and_saving() {

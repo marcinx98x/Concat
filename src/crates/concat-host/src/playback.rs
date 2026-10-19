@@ -8,12 +8,12 @@
 //!
 //! The shape of it:
 //!
-//! - Every audible clip's span is decoded **once** straight to raw PCM -
-//!   the clip's filter chain and speed baked in with the same filters the
-//!   exporter uses, so the preview and the export cannot disagree. The
-//!   PCM lands as a file in the project's cache and is memory-mapped, so
-//!   memory stays bounded however long the material is, and a reopened
-//!   project pays nothing.
+//! - Audible clips are decoded to raw PCM in **short segments** (~30 s of
+//!   timeline), not the whole span at once: a long MKV would otherwise
+//!   keep two workers and the demuxer busy for minutes while the picture
+//!   tries to soft-decode the same file. Filter chain and speed match the
+//!   exporter. Each segment is a cache file, memory-mapped; only the
+//!   playhead's segment and a couple ahead are queued.
 //!
 //! - One cpal output stream mixes the mapped clips sample by sample, with
 //!   volume and fades applied at mix time. Gain-only edits therefore never
@@ -66,6 +66,14 @@ const DISK_CACHE_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 /// Concurrent FFmpeg decode processes. Two keeps a dual-span edit prompt
 /// without letting a scrubbed trim fan out a dozen full-file decodes.
 const DECODE_WORKERS: usize = 2;
+
+/// Timeline seconds per cached PCM segment. Long enough that decode
+/// overhead stays small; short enough that adding a 45-minute clip does
+/// not bake the whole episode before the first play.
+const SEGMENT_SECS: f64 = 30.0;
+
+/// Extra segments queued ahead of the one under the playhead.
+const SEGMENT_LOOKAHEAD: u32 = 2;
 
 /// One key of a clip's gain ride, as a spec carries it.
 ///
@@ -226,7 +234,8 @@ struct ActiveClip {
     volume_curve: Track,
     fade_in: f64,
     fade_out: f64,
-    pcm: Arc<Pcm>,
+    /// Decoded segments by index; missing ones play as silence until they land.
+    segments: HashMap<u32, Arc<Pcm>>,
 }
 
 /// A spec's gain keys as the engine's track.
@@ -371,7 +380,55 @@ fn fine_timer(on: bool) {
 struct DecodeJob {
     spec: ClipSpec,
     project: PathBuf,
+    /// [`decode_key`] without the segment suffix — for "still wanted" checks.
+    base_key: String,
+    segment: u32,
+    /// Cache / on-disk key: `{base}-{segment:04}`.
     key: String,
+}
+
+/// How many [`SEGMENT_SECS`] slices cover a clip of `duration` timeline seconds.
+fn segment_count(duration: f64) -> u32 {
+    if duration <= 0.0 {
+        return 1;
+    }
+    ((duration / SEGMENT_SECS).ceil() as u32).max(1)
+}
+
+fn segment_key(base: &str, segment: u32) -> String {
+    format!("{base}-{segment:04}")
+}
+
+/// Segment indices to keep warm for a clip around timeline time `at`.
+fn segments_near(clip_start: f64, clip_duration: f64, at: f64) -> Vec<u32> {
+    let count = segment_count(clip_duration);
+    let local = at - clip_start;
+    // Warm the start when the playhead is about to enter the clip.
+    if local < 0.0 {
+        if clip_start - at < SEGMENT_SECS {
+            return (0..count.min(SEGMENT_LOOKAHEAD + 1)).collect();
+        }
+        return Vec::new();
+    }
+    if local >= clip_duration {
+        return Vec::new();
+    }
+    let current = (local / SEGMENT_SECS).floor() as u32;
+    (current..=current.saturating_add(SEGMENT_LOOKAHEAD))
+        .filter(|&segment| segment < count)
+        .collect()
+}
+
+/// Every segment key the current clip set may still need on disk.
+fn live_segment_keys(specs: &[ClipSpec]) -> HashSet<String> {
+    let mut live = HashSet::new();
+    for spec in specs {
+        let base = decode_key(spec);
+        for segment in 0..segment_count(spec.duration) {
+            live.insert(segment_key(&base, segment));
+        }
+    }
+    live
 }
 
 /// The decode queue: newest job first, because a scrub over a trim handle
@@ -499,13 +556,15 @@ impl Playback {
     }
 
     /// Starts playing from `position` seconds.
-    pub fn play(&self, position: f64) {
+    pub fn play(self: &Arc<Self>, position: f64) {
         if !self.fine.swap(true, Ordering::Relaxed) {
             fine_timer(true);
         }
-        self.shared.stamp(position);
+        let at = position.max(0.0);
+        self.shared.stamp(at);
         self.shared.playing.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(Msg::Play(position.max(0.0)));
+        self.ensure_near(at);
+        let _ = self.tx.send(Msg::Play(at));
     }
 
     /// Stops playing; the position holds.
@@ -518,12 +577,13 @@ impl Playback {
     }
 
     /// Moves the playhead, playing or paused.
-    pub fn seek(&self, position: f64) {
+    pub fn seek(self: &Arc<Self>, position: f64) {
         let clamped = position.max(0.0);
         // The callback owns the clock while playing, but a paused callback
         // returns before storing - so a paused seek must land the shared
         // position itself, or the atomic keeps serving the pre-seek time.
         self.shared.stamp(clamped);
+        self.ensure_near(clamped);
         let _ = self.tx.send(Msg::Seek(clamped));
     }
 
@@ -563,33 +623,46 @@ impl Playback {
 
     /// Replaces the audible clip set.
     ///
-    /// Anything already decoded plays immediately; anything new joins the
-    /// decode queue and joins the mix when it lands. `project` is the
-    /// project folder, whose cache holds the PCM files.
+    /// Segments already decoded play immediately; only those near the
+    /// playhead are queued. `project` is the project folder, whose cache
+    /// holds the PCM files.
     pub fn set_clips(self: &Arc<Self>, project: PathBuf, specs: Vec<ClipSpec>) {
-        *locked(&self.specs) = specs.clone();
+        *locked(&self.specs) = specs;
         *locked(&self.project) = Some(project.clone());
-
-        for spec in specs {
-            let key = decode_key(&spec);
-            if locked(&self.cache).contains_key(&key) {
-                continue;
-            }
-            if !locked(&self.decoding).insert(key.clone()) {
-                continue;
-            }
-            let mut jobs = locked(&self.queue.jobs);
-            jobs.push_back(DecodeJob {
-                spec,
-                project: project.clone(),
-                key,
-            });
-            self.queue.available.notify_one();
-        }
-
+        self.ensure_near(self.shared.position_now());
         self.resync();
         self.evict_memory();
         self.sweep_disk(project);
+    }
+
+    /// Queues missing PCM segments covering `at` and a short lookahead for
+    /// every audible clip. Cheap when the cache is warm.
+    fn ensure_near(self: &Arc<Self>, at: f64) {
+        let Some(project) = locked(&self.project).clone() else {
+            return;
+        };
+        let specs = locked(&self.specs).clone();
+        for spec in specs {
+            let base = decode_key(&spec);
+            for segment in segments_near(spec.start, spec.duration, at) {
+                let key = segment_key(&base, segment);
+                if locked(&self.cache).contains_key(&key) {
+                    continue;
+                }
+                if !locked(&self.decoding).insert(key.clone()) {
+                    continue;
+                }
+                let mut jobs = locked(&self.queue.jobs);
+                jobs.push_back(DecodeJob {
+                    spec: spec.clone(),
+                    project: project.clone(),
+                    base_key: base.clone(),
+                    segment,
+                    key,
+                });
+                self.queue.available.notify_one();
+            }
+        }
     }
 
     /// Sends the mix callback everything currently wanted *and* decoded, and
@@ -600,18 +673,25 @@ impl Playback {
         let mut cache = locked(&self.cache);
         let active: Vec<ActiveClip> = specs
             .iter()
-            .filter_map(|spec| {
-                let entry = cache.get_mut(&decode_key(spec))?;
-                entry.last_used = now;
-                Some(ActiveClip {
+            .map(|spec| {
+                let base = decode_key(spec);
+                let mut segments = HashMap::new();
+                for segment in 0..segment_count(spec.duration) {
+                    let key = segment_key(&base, segment);
+                    if let Some(entry) = cache.get_mut(&key) {
+                        entry.last_used = now;
+                        segments.insert(segment, Arc::clone(&entry.pcm));
+                    }
+                }
+                ActiveClip {
                     start: spec.start,
                     duration: spec.duration,
                     volume: spec.volume,
                     volume_curve: track_of(&spec.volume_curve),
                     fade_in: spec.fade_in,
                     fade_out: spec.fade_out,
-                    pcm: Arc::clone(&entry.pcm),
-                })
+                    segments,
+                }
             })
             .collect();
         drop(cache);
@@ -624,7 +704,7 @@ impl Playback {
     /// space and page cache, not copies - but a long session accumulates a
     /// mapping per edit of every trimmed span, and those add up.
     fn evict_memory(&self) {
-        let live: HashSet<String> = locked(&self.specs).iter().map(decode_key).collect();
+        let live = live_segment_keys(&locked(&self.specs));
         let mut cache = locked(&self.cache);
         while cache.len() > MEMORY_CACHE_CAP {
             let doomed = cache
@@ -653,7 +733,7 @@ impl Playback {
         let spawned = std::thread::Builder::new()
             .name("audio-cache-sweep".into())
             .spawn(move || {
-                let live: HashSet<String> = locked(&this.specs).iter().map(decode_key).collect();
+                let live = live_segment_keys(&locked(&this.specs));
                 let directory = project.join("cache").join("audio");
                 if let Some(doomed) = sweep_plan(&directory, &live, DISK_CACHE_BUDGET) {
                     for path in doomed {
@@ -685,20 +765,17 @@ fn decode_worker(playback: &Arc<Playback>) {
             }
         };
 
-        // A span queued by an edit that has since been edited again is dead
-        // weight; skip it before paying for FFmpeg.
-        let wanted = playback
-            .specs
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|spec| decode_key(spec) == job.key);
+        // A segment queued by an edit that has since been edited again is
+        // dead weight; skip it before paying for FFmpeg.
+        let wanted = locked(&playback.specs).iter().any(|spec| {
+            decode_key(spec) == job.base_key && job.segment < segment_count(spec.duration)
+        });
         if !wanted {
             locked(&playback.decoding).remove(&job.key);
             continue;
         }
 
-        match decode(&job.spec, &job.project, &job.key) {
+        match decode(&job.spec, &job.project, &job.key, job.segment) {
             Ok(pcm) => {
                 let now = playback.tick.fetch_add(1, Ordering::Relaxed) + 1;
                 locked(&playback.cache).insert(
@@ -716,6 +793,8 @@ fn decode_worker(playback: &Arc<Playback>) {
         }
         locked(&playback.decoding).remove(&job.key);
         playback.resync();
+        // Keep the runway ahead of the playhead as segments land.
+        playback.ensure_near(playback.shared.position_now());
     }
 }
 
@@ -810,12 +889,12 @@ fn decode_key(spec: &ClipSpec) -> String {
     format!("{hash:016x}")
 }
 
-/// Decodes one clip span to the cache and maps it.
+/// Decodes one timeline segment of a clip to the cache and maps it.
 ///
 /// The decode mirrors the exporter's treatment of filters and speed, so
 /// what the preview mixes is what the export renders. A file already in the
 /// cache is reused as is - that is the point of the cache.
-fn decode(spec: &ClipSpec, project: &Path, key: &str) -> Result<Pcm, String> {
+fn decode(spec: &ClipSpec, project: &Path, key: &str, segment: u32) -> Result<Pcm, String> {
     use concat_media::{AudioDecoder, AudioOptions, SampleFormat};
 
     concat_media::audio::validate_chain(&spec.chain).map_err(|error| error.to_string())?;
@@ -837,15 +916,26 @@ fn decode(spec: &ClipSpec, project: &Path, key: &str) -> Result<Pcm, String> {
         filters.push(spec.chain.clone());
     }
 
+    let speed = concat_media::audio::clamp_speed(spec.speed);
+    let seg_start = f64::from(segment) * SEGMENT_SECS;
+    if seg_start >= spec.duration && spec.duration > 0.0 {
+        return Err(format!("segment {segment} is past the clip"));
+    }
+    let seg_timeline = if spec.duration > 0.0 {
+        (spec.duration - seg_start).min(SEGMENT_SECS).max(0.0)
+    } else {
+        SEGMENT_SECS
+    };
     // A sped-up clip reads further into the file than it occupies on the
-    // timeline: the source window is `duration * speed`, exactly the window
-    // the exporter trims.
-    let window = spec.duration * concat_media::audio::clamp_speed(spec.speed);
+    // timeline: the source window is `seg_timeline * speed`, as the full
+    // span used to be `duration * speed`.
+    let source_start = spec.source_start + seg_start * speed;
+    let window = seg_timeline * speed;
 
     let mut decoder = AudioDecoder::open(
         &spec.path,
         &AudioOptions {
-            start: Some(spec.source_start),
+            start: Some(source_start),
             duration: Some(window),
             filters,
             rate: PCM_RATE,
@@ -1146,13 +1236,18 @@ where
                             continue;
                         }
 
+                        let segment = (local / SEGMENT_SECS).floor() as u32;
+                        let within = local - f64::from(segment) * SEGMENT_SECS;
+                        let Some(pcm) = clip.segments.get(&segment) else {
+                            continue;
+                        };
+
                         // Linear interpolation across the 48k source grid -
                         // exact when the device runs at 48k, inaudibly close
                         // when it does not.
-                        let read = local * f64::from(PCM_RATE);
+                        let read = within * f64::from(PCM_RATE);
                         let index = read.floor() as u64;
                         let fraction = (read - read.floor()) as f32;
-                        let pcm = &clip.pcm;
                         left += gain
                             * (pcm.sample(index, 0) * (1.0 - fraction)
                                 + pcm.sample(index + 1, 0) * fraction);
@@ -1217,8 +1312,30 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{COAST, Shared, sweep_plan, wav_data_range};
+    use super::{
+        COAST, SEGMENT_SECS, Shared, segment_count, segment_key, segments_near, sweep_plan,
+        wav_data_range,
+    };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn segment_count_covers_the_clip_in_fixed_slices() {
+        assert_eq!(segment_count(0.0), 1);
+        assert_eq!(segment_count(SEGMENT_SECS), 1);
+        assert_eq!(segment_count(SEGMENT_SECS + 0.01), 2);
+        assert_eq!(segment_count(90.0), 3);
+        assert_eq!(segment_count(2_700.0), 90);
+    }
+
+    #[test]
+    fn segments_near_the_playhead_include_lookahead() {
+        assert_eq!(segments_near(0.0, 120.0, 0.0), vec![0, 1, 2]);
+        assert_eq!(segments_near(0.0, 120.0, 35.0), vec![1, 2, 3]);
+        // Clip is only two segments long — lookahead cannot invent a third.
+        assert_eq!(segments_near(10.0, 60.0, 5.0), vec![0, 1]);
+        assert!(segments_near(100.0, 60.0, 0.0).is_empty());
+        assert_eq!(segment_key("abcd", 3), "abcd-0003");
+    }
 
     #[test]
     fn the_clock_runs_on_between_buffers_but_not_past_a_stall() {

@@ -477,7 +477,7 @@
   "settings.packageOpened": "Concat {0} se ha descargado y está abierto en el instalador de paquetes. Instálalo ahí y vuelve a abrir Concat.",
   "settings.playhead": "Playhead",
   "settings.proxies": "Proxies",
-  "settings.proxiesHint": "Desactivado, la reproducción lee tus archivos tal cual. Activado, cada vídeo mayor que HD obtiene una copia más pequeña, creada una vez en segundo plano, para una reproducción más fluida en Media y Un cuarto.",
+  "settings.proxiesHint": "Activado por defecto: cada vídeo HD o mayor obtiene una copia más pequeña en segundo plano para una reproducción más fluida en Media y Un cuarto; la exportación sigue usando el original. Desactivado: la reproducción lee tus archivos tal cual.",
   "settings.rose": "Rosa",
   "settings.runsLocally": "Se ejecuta localmente",
   "settings.scale": "Scale",

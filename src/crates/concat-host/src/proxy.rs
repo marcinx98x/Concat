@@ -7,7 +7,7 @@
 //!
 //! A 4K file decodes at a few frames a second on a laptop without
 //! hardware decode; its quarter-size copy decodes at dozens. So a file
-//! larger than HD gets one, written on the scheduler's proxy lane - one
+//! at HD or larger gets one, written on the scheduler's proxy lane - one
 //! at a time, on two threads, so the machine stays usable meanwhile - and
 //! adopted into the reader pool as the file's stand-in. A request that
 //! asks for the proxy reads it; the paused monitor and the export never
@@ -24,8 +24,10 @@ use concat_core::frame::Signal;
 use concat_media::decode::{DecodeOptions, Decoder, FrameSource};
 use concat_media::{ColorRange, EncodeOptions, Encoder, FrameSink, Priority, RateMode, VideoCodec};
 
-/// A file with more pixels than this gets a proxy: anything larger than
-/// full HD.
+/// A file with at least this many pixels gets a proxy: full HD and up.
+/// Exact 1080p WEB-DL used to skip proxies (`>`), so Half playback still
+/// soft-decoded the original and stuttered; `>=` lets Settings → Proxies
+/// cover that case.
 const PIXELS_WITHOUT_PROXY: u64 = 1920 * 1080;
 /// The proxy's long side is the original's divided by this, and never
 /// shorter than [`SHORTEST_LONG_SIDE`].
@@ -34,7 +36,7 @@ const SHORTEST_LONG_SIDE: u32 = 960;
 
 /// Whether a `width` by `height` file is worth a proxy.
 pub fn wanted(width: u32, height: u32) -> bool {
-    u64::from(width) * u64::from(height) > PIXELS_WITHOUT_PROXY
+    u64::from(width) * u64::from(height) >= PIXELS_WITHOUT_PROXY
 }
 
 /// The proxy's size for a `width` by `height` original: the long side a
@@ -339,8 +341,8 @@ mod tests {
     }
 
     #[test]
-    fn only_files_larger_than_hd_get_a_proxy() {
-        assert!(!wanted(1920, 1080));
+    fn hd_and_larger_get_a_proxy() {
+        assert!(wanted(1920, 1080));
         assert!(!wanted(1280, 720));
         assert!(wanted(3840, 2160));
         assert!(wanted(2560, 1440));
