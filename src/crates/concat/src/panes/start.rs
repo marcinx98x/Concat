@@ -313,10 +313,18 @@ impl StartPane {
                 }
             }
             StartMsg::ForgetRecent(path) => {
-                if let Err(error) = projects::forget(&studio.host.dirs.config, &path) {
-                    studio.notify(&error, true);
-                }
-                studio.recents = projects::recents(&studio.host.dirs.config);
+                let name = studio
+                    .recents
+                    .iter()
+                    .find(|recent| recent.info.path == path)
+                    .map(|recent| recent.info.name.clone())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone())
+                    });
+                studio.confirm = Some(crate::studio::Confirm::DeleteProject { path, name });
             }
             StartMsg::RevealRecent(path) => {
                 if let Err(error) = platform::reveal(&path) {

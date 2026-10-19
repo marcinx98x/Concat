@@ -533,6 +533,18 @@ pub fn forget(config: &Path, path: &str) -> Result<(), String> {
     write_recents(config, &entries)
 }
 
+/// Removes one project from the list and deletes its folder when it is still
+/// a project on disk. Missing or non-project paths only leave the list.
+pub fn delete(config: &Path, path: &str) -> Result<(), String> {
+    forget(config, path)?;
+    let root = Path::new(path);
+    if !is_project(root) {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(root)
+        .map_err(|error| format!("could not delete {}: {error}", root.display()))
+}
+
 fn read_recents(config: &Path) -> Vec<ProjectInfo> {
     // A missing or corrupt list is not an error worth showing anyone; it just
     // means there is no history yet.
@@ -697,6 +709,48 @@ mod tests {
         assert!(same_path("D:\\Work\\Film", "d:\\work\\film"));
         assert!(!same_path("D:\\Work\\Film", "D:\\Work\\Other"));
         assert!(same_path("/work/film/", "/work/film"));
+    }
+
+    #[test]
+    fn delete_removes_the_folder_and_the_list_entry() {
+        let config = scratch("delete-config");
+        let root = scratch("delete-project");
+        std::fs::write(Path::new(&root).join(MANIFEST), b"{}").expect("writes");
+        assert!(is_project(Path::new(&root)));
+        let info = ProjectInfo {
+            path: root.clone(),
+            name: "Gone".into(),
+            width: 1920,
+            height: 1080,
+            rate_num: 30,
+            rate_den: 1,
+            opened_at: 1,
+        };
+        write_recents(Path::new(&config), &[info]).expect("lists");
+        delete(Path::new(&config), &root).expect("deletes");
+        assert!(!Path::new(&root).exists());
+        assert!(recents(Path::new(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn delete_still_forgets_a_missing_folder() {
+        let config = scratch("delete-missing-config");
+        let root = scratch("delete-missing-project");
+        let _ = std::fs::remove_dir_all(&root);
+        let info = ProjectInfo {
+            path: root.clone(),
+            name: "Gone".into(),
+            width: 1920,
+            height: 1080,
+            rate_num: 30,
+            rate_den: 1,
+            opened_at: 1,
+        };
+        write_recents(Path::new(&config), &[info]).expect("lists");
+        delete(Path::new(&config), &root).expect("forgets");
+        assert!(recents(Path::new(&config)).is_empty());
+        let _ = std::fs::remove_dir_all(&config);
     }
 
     #[cfg(windows)]

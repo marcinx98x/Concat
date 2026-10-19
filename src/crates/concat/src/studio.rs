@@ -2238,6 +2238,8 @@ pub enum Confirm {
     /// this a disk unplugged, full or read-only made a window that would
     /// never close.
     QuitWithoutSaving { error: String },
+    /// Deleting a recent project from the start screen, and its folder.
+    DeleteProject { path: String, name: String },
 }
 
 /// One clip on the clipboard: the clip as it was when copied, and the row
@@ -2634,6 +2636,12 @@ impl Studio {
                 self.release_project();
                 slint::quit_event_loop().ok();
             }
+            Some(Confirm::DeleteProject { path, .. }) => {
+                if let Err(error) = projects::delete(&self.host.dirs.config, &path) {
+                    self.notify(&error, true);
+                }
+                self.recents = projects::recents(&self.host.dirs.config);
+            }
             None => {}
         }
     }
@@ -2674,6 +2682,12 @@ impl Studio {
                 title: t("close.unsavedTitle").into(),
                 message: tf("close.unsavedMessage", &[error]).into(),
                 action: t("close.quitWithoutSaving").into(),
+            },
+            Confirm::DeleteProject { name, .. } => crate::ui::ConfirmData {
+                open: true,
+                title: t("start.deleteProjectTitle").into(),
+                message: tf("start.deleteProjectMessage", &[name]).into(),
+                action: t("common.delete").into(),
             },
         }
     }
