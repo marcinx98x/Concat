@@ -124,11 +124,25 @@ fn audio_filter(options: &AudioOptions, origin: f64) -> String {
     parts.join(",")
 }
 
+/// `abuffer` option string for a decoded frame: sample-rate time base, hex
+/// channel layout when the description would confuse the filter parser.
+fn abuffer_args(frame: &Audio) -> String {
+    format!(
+        "time_base=1/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
+        frame.rate(),
+        frame.rate(),
+        frame.format().name(),
+        ffi::abuffer_channel_layout(&frame.ch_layout())
+    )
+}
+
 /// Decodes a file's audio through libavcodec and libavfilter.
 pub struct AudioDecoder {
     path: PathBuf,
     input: format::context::Input,
     stream: usize,
+    /// Container stream time base: decoded frames carry PTS in these units
+    /// until they are rescaled into the abuffer's sample-rate clock.
     time_base: ffmpeg::Rational,
     /// The stream's first timestamp, in seconds: where its source time 0
     /// is, the way the picture and the export mix measure it.
@@ -138,6 +152,9 @@ pub struct AudioDecoder {
     held: crate::feed::Held<ffmpeg::Packet>,
     options: AudioOptions,
     graph: Option<filter::Graph>,
+    /// The stream's `abuffer` args for the last graph, kept so a failed
+    /// `buffersrc.add` can name what it disagreed with.
+    abuffer_args: String,
     /// The codec has been drained and the graph flushed; only what the sink
     /// still holds is left.
     flushed: bool,
@@ -179,9 +196,30 @@ impl AudioDecoder {
         let origin = ffi::start_of(&stream).as_f64();
         let context = ffmpeg::codec::Context::from_parameters(stream.parameters())
             .map_err(|error| ffi::fail("codec parameters", path, error))?;
-        let decoder = context
-            .decoder()
-            .audio()
+        // (E-)AC-3 downmixes only when the decoder option `downmix` is set
+        // (AC3DecodeContext.downmix_layout). Overwriting ch_layout before
+        // open2 does not; surround then reaches abuffer as 5.1(side) /
+        // 0x60f and buffersrc.add returns EINVAL. Playback and peaks want
+        // stereo; the transcriber wants mono. Unknown on other codecs —
+        // open2 leaves unused options in the dict and still succeeds.
+        let decoder = context.decoder();
+        let codec = ffmpeg::decoder::find(decoder.id()).ok_or_else(|| Error::Ffi {
+            operation: "open decoder",
+            path: path.to_path_buf(),
+            detail: "decoder not found".to_owned(),
+        })?;
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set(
+            "downmix",
+            if options.channels == 1 {
+                "mono"
+            } else {
+                "stereo"
+            },
+        );
+        let decoder = decoder
+            .open_as_with(codec, opts)
+            .and_then(|opened| opened.audio())
             .map_err(|error| ffi::fail("open decoder", path, error))?;
 
         // Near the start, not at it: the graph's atrim does the exact cut,
@@ -205,6 +243,7 @@ impl AudioDecoder {
             held: None,
             options: options.clone(),
             graph: None,
+            abuffer_args: String::new(),
             flushed: false,
             done: false,
         })
@@ -220,16 +259,13 @@ impl AudioDecoder {
         self.options.channels
     }
 
-    fn build_graph(&self, first: &Audio) -> Result<filter::Graph> {
+    fn build_graph(&self, first: &Audio) -> Result<(filter::Graph, String)> {
         let mut graph = filter::Graph::new();
-        let args = format!(
-            "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
-            self.time_base.numerator(),
-            self.time_base.denominator(),
-            first.rate(),
-            first.format().name(),
-            ffi::abuffer_channel_layout(&first.ch_layout())
-        );
+        // Sample-rate time base, matching the export mix and FFmpeg's own
+        // auto-graph (`tb:1/48000`). Stream TB can be 1/1000 on MKV; that
+        // disagrees with frame PTS counted in samples and makes abuffer
+        // reject the frame.
+        let args = abuffer_args(first);
         let missing = |name: &str| Error::Missing {
             what: "filter",
             name: name.to_owned(),
@@ -256,7 +292,7 @@ impl AudioDecoder {
         graph
             .validate()
             .map_err(|error| ffi::fail("filter graph", &self.path, error))?;
-        Ok(graph)
+        Ok((graph, args))
     }
 
     /// One decoded frame out of the codec, or `None` when the file is over.
@@ -297,16 +333,27 @@ impl AudioDecoder {
             // The graph wants more. Feed it the next decoded frame, or tell
             // it the file is over.
             match self.next_source()? {
-                Some(frame) => {
+                Some(mut frame) => {
                     if self.graph.is_none() {
-                        self.graph = Some(self.build_graph(&frame)?);
+                        let (graph, args) = self.build_graph(&frame)?;
+                        self.graph = Some(graph);
+                        self.abuffer_args = args;
+                    }
+                    // abuffer runs on a 1/rate clock; frames still carry
+                    // stream PTS. Rescale so atrim sees real seconds (MKV
+                    // often has TB 1/1000; MPEG-TS 1/90000).
+                    let sample_tb = ffmpeg::Rational::new(1, frame.rate() as i32);
+                    if let Some(pts) = frame.timestamp() {
+                        use ffmpeg::rescale::Rescale;
+                        frame.set_pts(Some(pts.rescale(self.time_base, sample_tb)));
                     }
                     let graph = self.graph.as_mut().expect("just built");
                     let mut context = graph.get("in").expect("the graph has an input");
-                    context
-                        .source()
-                        .add(&frame)
-                        .map_err(|error| ffi::fail("filter", &self.path, error))?;
+                    context.source().add(&frame).map_err(|error| Error::Ffi {
+                        operation: "filter",
+                        path: self.path.clone(),
+                        detail: format!("{error} (abuffer={})", self.abuffer_args),
+                    })?;
                 }
                 None => {
                     let Some(graph) = self.graph.as_mut() else {
@@ -454,5 +501,83 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_error_not_a_panic() {
         assert!(AudioDecoder::open("does-not-exist.mp3", &AudioOptions::default()).is_err());
+    }
+
+    /// Opening for stereo passes `downmix=stereo` into `avcodec_open2` and
+    /// still decodes an ordinary stereo/mono fixture without filter errors.
+    #[test]
+    fn open_for_stereo_decodes_with_downmix_option() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/tone-at-1s.ts");
+        let options = AudioOptions {
+            channels: 2,
+            duration: Some(0.1),
+            format: SampleFormat::F32,
+            ..AudioOptions::default()
+        };
+        let mut decoder = AudioDecoder::open(path, &options).expect("opens");
+        assert_eq!(decoder.channels(), 2);
+        let samples = decoder.collect_f32().expect("decodes");
+        assert!(!samples.is_empty(), "expected some stereo samples");
+    }
+
+    #[test]
+    fn abuffer_args_use_sample_rate_time_base() {
+        ffi::init();
+        let mut frame = Audio::new(
+            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+            1_024,
+            ffmpeg::util::channel_layout::ChannelLayoutMask::STEREO,
+        );
+        frame.set_ch_layout(ffmpeg::util::channel_layout::ChannelLayout::STEREO);
+        frame.set_rate(48_000);
+        let args = abuffer_args(&frame);
+        assert!(
+            args.starts_with("time_base=1/48000:sample_rate=48000:"),
+            "{args}"
+        );
+        assert!(args.contains("channel_layout=0x3"), "{args}");
+    }
+
+    /// AC-3 / DDP 5.1(side) MKV: set `CONCAT_TEST_AC3` to a path, or use
+    /// the Synology fixture when that share is mounted. Must actually decode
+    /// (not only open) so a false-green from overwriting ch_layout cannot
+    /// hide a failed `buffersrc.add`.
+    #[test]
+    fn ac3_51_side_decodes_as_stereo() {
+        let path = std::env::var("CONCAT_TEST_AC3").unwrap_or_else(|_| {
+            r"\\Synology\Pobrane\xxxSlow.Horses.S03E01.PLSUB.1080p.ATVP.WEB-DL.DDP5.1.H.264-GloriousMongoose\xSlow Horses - 3x03 - Negotiating with Tigers.mkv"
+                .to_owned()
+        });
+        if !Path::new(&path).is_file() {
+            eprintln!("skipping ac3_51_side_decodes_as_stereo: {path} not found");
+            return;
+        }
+        let options = AudioOptions {
+            duration: Some(0.5),
+            rate: 48_000,
+            channels: 2,
+            format: SampleFormat::F32,
+            ..AudioOptions::default()
+        };
+        let mut decoder = AudioDecoder::open(&path, &options).expect("opens AC-3");
+        let samples = decoder.collect_f32().expect("decodes through abuffer");
+        assert!(
+            !decoder.abuffer_args.contains("0x60f"),
+            "abuffer should see stereo after downmix, got {}",
+            decoder.abuffer_args
+        );
+        assert!(
+            decoder.abuffer_args.contains("channel_layout=0x3"),
+            "expected stereo abuffer layout, got {}",
+            decoder.abuffer_args
+        );
+        // 0.5 s × 48 kHz × 2 channels, allow a little short from atrim.
+        // Opening seconds of a show may be near-silent; length + stereo
+        // abuffer is the regression check for buffersrc EINVAL.
+        assert!(
+            samples.len() >= 40_000,
+            "expected ~0.5 s stereo, got {} samples",
+            samples.len()
+        );
     }
 }
