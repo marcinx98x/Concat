@@ -3281,54 +3281,60 @@ impl Studio {
         log::debug!("playback: playing from {:.3}s", self.playhead);
         self.host.playback.play(f64::from(self.playhead));
         self.wake_meters();
-        // The clock is the audio device's. This looks at it far more often
-        // than any timeline's frame rate and acts only when the frame under
-        // it changes, so each frame is asked for within a few milliseconds of
-        // its time instead of whenever a fixed 30 Hz beat next comes round -
-        // which at 24, 25 or 60 fps is unevenly late, and reads as judder.
+        // The clock is the audio device's. Poll far more often than the
+        // timeline fps: the playhead line tracks continuous time every tick
+        // (CapCut-style), while the monitor still asks for a frame only when
+        // the frame index changes — otherwise 24/25/60 would judder against a
+        // fixed 30 Hz beat.
         let mut shown: Option<i64> = None;
         self.transport.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_millis(8),
             move || {
                 crate::host::Shell::with(|shell, app| {
+                    let mut publish = false;
                     {
                         let mut studio = shell.studio.borrow_mut();
                         let end = studio.duration();
                         let position = studio.host.playback.position_now() as f32;
                         let fps = studio.project().active().video.rate();
                         let frame = (f64::from(position) * fps + 1e-6).floor() as i64;
-                        if position < end && shown == Some(frame) {
-                            return;
-                        }
-                        shown = Some(frame);
                         studio.playhead = position.min(end);
-                        // The view follows: a playhead that runs off the
-                        // right edge, or sits off the left, pages the lanes
-                        // to it, the way every editor keeps the cut in view.
-                        // A phone's lanes glide instead, the playhead held
-                        // at their middle.
-                        if studio.lanes.centred {
-                            let playhead = studio.playhead;
-                            studio.lanes.recentre(playhead);
-                        } else if let Some((low, high)) = studio.lanes.published_span() {
-                            let screen = (high - low) / 3.0;
-                            let left = studio.lanes.scroll_left;
-                            if screen > 0.0
-                                && (studio.playhead > left + screen * 0.95
-                                    || studio.playhead < left)
-                            {
-                                studio.lanes.scroll_left =
-                                    (studio.playhead - screen * 0.05).max(0.0);
-                            }
-                        }
                         if position >= end {
                             studio.pause();
-                        } else {
+                            publish = true;
+                        } else if shown != Some(frame) {
+                            shown = Some(frame);
+                            publish = true;
+                            // The view follows: a playhead that runs off the
+                            // right edge, or sits off the left, pages the lanes
+                            // to it, the way every editor keeps the cut in view.
+                            // A phone's lanes glide instead, the playhead held
+                            // at their middle.
+                            if studio.lanes.centred {
+                                let playhead = studio.playhead;
+                                studio.lanes.recentre(playhead);
+                            } else if let Some((low, high)) = studio.lanes.published_span() {
+                                let screen = (high - low) / 3.0;
+                                let left = studio.lanes.scroll_left;
+                                if screen > 0.0
+                                    && (studio.playhead > left + screen * 0.95
+                                        || studio.playhead < left)
+                                {
+                                    studio.lanes.scroll_left =
+                                        (studio.playhead - screen * 0.05).max(0.0);
+                                }
+                            }
                             studio.request_preview();
                         }
                     }
-                    shell.studio.borrow().publish_lanes(&app, &shell.models);
+                    // Always move the line; full lane publish only when the
+                    // frame (or end) changes — publish_lanes is heavy.
+                    app.global::<Editor>()
+                        .set_playhead(shell.studio.borrow().playhead);
+                    if publish {
+                        shell.studio.borrow().publish_lanes(&app, &shell.models);
+                    }
                 });
             },
         );
@@ -4457,14 +4463,14 @@ impl Studio {
                     } else {
                         position
                     };
+                    if let Some(audition) = studio.audition.as_mut() {
+                        audition.at = at;
+                    }
                     let frame = (f64::from(at) * fps + 1e-6).floor() as i64;
                     if shown == Some(frame) {
                         return;
                     }
                     shown = Some(frame);
-                    if let Some(audition) = studio.audition.as_mut() {
-                        audition.at = at;
-                    }
                     studio.request_preview();
                 });
             },
