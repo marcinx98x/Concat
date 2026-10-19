@@ -228,7 +228,7 @@ impl AudioDecoder {
             self.time_base.denominator(),
             first.rate(),
             first.format().name(),
-            first.ch_layout().description()
+            ffi::abuffer_channel_layout(&first.ch_layout())
         );
         let missing = |name: &str| Error::Missing {
             what: "filter",

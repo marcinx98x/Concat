@@ -454,7 +454,7 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
             first.rate(),
             first.rate(),
             first.format().name(),
-            first.ch_layout().description()
+            crate::ffi::abuffer_channel_layout(&first.ch_layout())
         );
         graph
             .add(

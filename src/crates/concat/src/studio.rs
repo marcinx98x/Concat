@@ -1035,6 +1035,10 @@ pub struct Studio {
     /// first moment this window can be asked to fill the screen. A phone
     /// never sets it: its window is the screen already.
     present_maximized: std::cell::Cell<bool>,
+    /// Set when a project closes back to the launch screen, taken by the
+    /// next `publish`: the editor had filled the work area, and the start
+    /// sheet must not stay maximised. A phone never sets it.
+    present_restored: std::cell::Cell<bool>,
     pub start: crate::panes::start::StartPane,
     pub recents: Vec<projects::Recent>,
     pub posters: HashMap<String, slint::Image>,
@@ -2469,6 +2473,7 @@ impl Studio {
             toast: ToastState::default(),
             on_start: true,
             present_maximized: std::cell::Cell::new(false),
+            present_restored: std::cell::Cell::new(false),
             start,
             recents,
             posters: HashMap::new(),
@@ -9033,6 +9038,12 @@ impl Studio {
             .playback
             .set_clips(std::path::PathBuf::new(), Vec::new());
         self.on_start = true;
+        // The desk leaves the work area: the launch screen is a card-sized
+        // window again, not the editor that had filled the screen.
+        if !self.lanes.centred {
+            self.present_maximized.set(false);
+            self.present_restored.set(true);
+        }
         self.recents = projects::recents(&self.host.dirs.config);
     }
 
@@ -9407,6 +9418,7 @@ impl Studio {
 
     pub fn publish(&self, app: &App, models: &Models) {
         let fill_screen = self.present_maximized.replace(false);
+        let restore_screen = self.present_restored.replace(false);
         // The tray's three menu labels and the tooltips' bare-letter
         // hints, spelled from the keymap so a rebind moves the words
         // with the key. An action left unbound shows an em dash rather
@@ -9444,6 +9456,16 @@ impl Studio {
                     // size cannot put the window back.
                     app.window().set_maximized(true);
                     app.set_window_maximized(true);
+                }
+            });
+        } else if restore_screen {
+            let weak = app.as_weak();
+            // Same deferral as maximise: apply after the layout pass that
+            // this publish dirties, so the restore is not overwritten.
+            slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                if let Some(app) = weak.upgrade() {
+                    app.window().set_maximized(false);
+                    app.set_window_maximized(false);
                 }
             });
         }
