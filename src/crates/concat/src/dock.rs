@@ -14,13 +14,6 @@ pub const SEAT_MIN_H: f32 = 140.0;
 pub const SEAT_MIN_GRAB: f32 = 64.0;
 /// The gutter between the halves of a split, and the margin round the lot.
 pub const SEAT_GAP: f32 = 8.0;
-/// The VU meters' column needs only its ruler, its two bars and the
-/// padding round them: 26 + 14 + 14 and two gaps of 4, in 6px of padding
-/// a side (see meters-pane.slint).
-pub const METERS_MIN_W: f32 = 76.0;
-/// The meters' share of the bottom row in the default layout: a slim
-/// column beside the timeline, at its full height.
-const METERS_SHARE: f32 = 0.055;
 /// The top row's share of a wide window, before the timeline is lifted.
 pub const DEFAULT_TOP_SHARE: f32 = 0.6;
 /// The monitor's share of a narrow window, before the timeline is lifted.
@@ -145,6 +138,14 @@ impl Dock {
         walk(self, index, &mut seen, &mut path).then_some(path)
     }
 
+    /// Whether a view of this kind is anywhere in the tree.
+    pub fn contains(&self, kind: PaneKind) -> bool {
+        match self {
+            Dock::Leaf(held) => *held == kind,
+            Dock::Split { first, second, .. } => first.contains(kind) || second.contains(kind),
+        }
+    }
+
     pub fn kind_at(&self, index: usize) -> Option<PaneKind> {
         match self.at(&self.leaf_path(index)?) {
             Dock::Leaf(kind) => Some(*kind),
@@ -261,33 +262,32 @@ pub fn lay_out(node: &Dock, (x, y, w, h): (f32, f32, f32, f32), out: &mut DockLa
     }
 }
 
-/// The arrangement the editor opens with: the library, the monitor and the
-/// inspector across the top, the timeline along the bottom. The same three
-/// shares the fixed layout carried, re-expressed as a tree — 0.31 of the width
-/// to the library and 0.22 to the inspector, which is 0.319 of what is left
-/// once the library has had its share.
+/// The arrangement the editor opens with: the inspector a column down the
+/// whole right side, and in the rest the library and the monitor across the
+/// top and the timeline under both of them. The inspector is the tallest
+/// thing in the window - a stack of sections that would otherwise scroll -
+/// and the timeline gives up its right end to it, which is the end with
+/// nothing on it yet. About 0.22 of the width to the inspector and 0.25 to
+/// the library, which is 0.32 of what is left once the inspector has had
+/// its share; the timeline takes the lower 0.4 of the height.
 pub fn default_dock() -> Dock {
     Dock::Split {
-        columns: false,
-        ratio: DEFAULT_TOP_SHARE,
+        columns: true,
+        ratio: 0.78,
         first: Box::new(Dock::Split {
-            columns: true,
-            ratio: 0.31,
-            first: Dock::leaf(PaneKind::Media),
-            second: Box::new(Dock::Split {
+            columns: false,
+            ratio: DEFAULT_TOP_SHARE,
+            first: Box::new(Dock::Split {
                 columns: true,
-                ratio: 0.681,
-                first: Dock::leaf(PaneKind::Preview),
-                second: Dock::leaf(PaneKind::Inspector),
+                ratio: 0.32,
+                first: Dock::leaf(PaneKind::Media),
+                second: Dock::leaf(PaneKind::Preview),
             }),
+            // The timeline, whose VU meters are a column at its own right
+            // edge (see vu-meter.slint) rather than a seat of their own.
+            second: Dock::leaf(PaneKind::Timeline),
         }),
-        // The timeline, and the VU meters in a slim column beside it.
-        second: Box::new(Dock::Split {
-            columns: true,
-            ratio: 1.0 - METERS_SHARE,
-            first: Dock::leaf(PaneKind::Timeline),
-            second: Dock::leaf(PaneKind::Meters),
-        }),
+        second: Dock::leaf(PaneKind::Inspector),
     }
 }
 
@@ -307,18 +307,31 @@ pub fn compact_dock() -> Dock {
 
 /// Gives the timeline [`TIMELINE_LIFT`] pixels more than `base` would, on
 /// a workspace `height` pixels tall. The top row stays at least
-/// [`SEAT_MIN_H`]. Nothing happens when the root split is not the vertical
-/// one, or the workspace is too short to lift.
+/// [`SEAT_MIN_H`]. The vertical split that owns the timeline is the root
+/// on a compact window, or the left column under the inspector on a
+/// wide one. Nothing happens when neither is there, or the workspace is
+/// too short to lift.
 pub fn lift_timeline(dock: &mut Dock, base: f32, height: f32) {
     let usable = height - 3.0 * SEAT_GAP;
     if usable <= SEAT_MIN_H {
         return;
     }
+    let target = match dock {
+        Dock::Split {
+            columns: false, ..
+        } => dock,
+        Dock::Split {
+            columns: true,
+            first,
+            ..
+        } => first.as_mut(),
+        Dock::Leaf(_) => return,
+    };
     let Dock::Split {
         columns: false,
         ratio,
         ..
-    } = dock
+    } = target
     else {
         return;
     };
@@ -433,10 +446,22 @@ mod tests {
         let mut dock = default_dock();
         lift_timeline(&mut dock, DEFAULT_TOP_SHARE, height);
         let usable = height - 3.0 * SEAT_GAP;
-        let Dock::Split { ratio, columns, .. } = dock else {
-            panic!("the root is a split");
+        let Dock::Split {
+            columns: true,
+            first,
+            ..
+        } = dock
+        else {
+            panic!("the root is the inspector column");
         };
-        assert!(!columns);
+        let Dock::Split {
+            ratio,
+            columns: false,
+            ..
+        } = *first
+        else {
+            panic!("the left column is the timeline's split");
+        };
         let timeline = usable * (1.0 - ratio);
         let was = usable * (1.0 - DEFAULT_TOP_SHARE);
         assert!(
@@ -451,8 +476,11 @@ mod tests {
         let mut dock = default_dock();
         lift_timeline(&mut dock, DEFAULT_TOP_SHARE, height);
         let usable = height - 3.0 * SEAT_GAP;
-        let Dock::Split { ratio, .. } = dock else {
+        let Dock::Split { first, .. } = dock else {
             panic!("the root is a split");
+        };
+        let Dock::Split { ratio, .. } = *first else {
+            panic!("the left column is the timeline's split");
         };
         assert!(usable * ratio + 1e-3 >= SEAT_MIN_H, "{ratio}");
     }

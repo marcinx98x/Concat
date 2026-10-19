@@ -45,9 +45,6 @@ pub struct SkiaItemRenderer<'a> {
     path_cache: &'a ItemCache<Option<(Vector2D<f32, PhysicalPx>, skia_safe::Path)>>,
     text_layout_cache: &'a sharedparley::TextLayoutCache,
     box_shadow_cache: &'a SkiaBoxShadowCache,
-    /// LCD coverage for glyphs drawn here. The window sets it from the
-    /// desk's ClearType; a layer leaves it off.
-    lcd: bool,
 }
 
 impl<'a> SkiaItemRenderer<'a> {
@@ -60,7 +57,6 @@ impl<'a> SkiaItemRenderer<'a> {
         path_cache: &'a ItemCache<Option<(Vector2D<f32, PhysicalPx>, skia_safe::Path)>>,
         text_layout_cache: &'a sharedparley::TextLayoutCache,
         box_shadow_cache: &'a SkiaBoxShadowCache,
-        lcd: bool,
     ) -> Self {
         Self {
             canvas,
@@ -77,7 +73,6 @@ impl<'a> SkiaItemRenderer<'a> {
             path_cache,
             text_layout_cache,
             box_shadow_cache,
-            lcd,
         }
     }
 
@@ -1025,7 +1020,6 @@ impl<'a> LayerRenderer<'a> for SkiaItemRenderer<'a> {
             self.path_cache,
             self.text_layout_cache,
             self.box_shadow_cache,
-            false,
         );
         sub_renderer.translate(-bounding_rect.origin.to_vector());
 
@@ -1116,15 +1110,27 @@ impl GlyphRenderer for SkiaItemRenderer<'_> {
         // Hinting is left to Skia's default, which snaps stems on its own
         // once positions are whole.
         //
-        // LCD coverage on the window when ClearType is on, and greyscale in
-        // a layer. The desk says which, through `lcd` — asking the canvas
-        // (`SkCanvas::getTopProps`) faults on the window's canvas. On a
-        // surface with no order Skia makes greyscale out of LCD rendering,
-        // which on macOS turns on CoreText's font smoothing and draws every
-        // word heavier than it does today.
+        // LCD coverage where the surface drawn into names a subpixel order -
+        // the Windows window with ClearType on (wgpu_30_surface/dx12.rs) -
+        // and greyscale everywhere else. Asked for only there: on a surface
+        // with no order Skia makes greyscale out of LCD rendering, which on
+        // macOS turns on CoreText's font smoothing and draws every word
+        // heavier than it does today. Inside an opacity layer on that window
+        // the layer has no order, so Skia draws the text greyscale itself.
+        //
+        // The surface's props, not the top layer's: skia-safe's `top_props`
+        // calls SkCanvas::getTopProps, which returns a struct by value, and
+        // on MSVC a C++ method passes `this` and the return slot in the other
+        // order from the one Rust calls it with - Skia read a garbage `this`
+        // and the window crashed on its first frame of text. `props` fills
+        // an out-parameter and returns a bool, which both sides agree on.
         let dense = self.scale_factor.get() >= 1.5;
         font.set_subpixel(dense);
-        font.set_edging(if self.lcd {
+        let lcd = self
+            .canvas
+            .props()
+            .is_some_and(|props| props.pixel_geometry() != skia_safe::PixelGeometry::Unknown);
+        font.set_edging(if lcd {
             skia_safe::font::Edging::SubpixelAntiAlias
         } else {
             skia_safe::font::Edging::AntiAlias

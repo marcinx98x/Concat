@@ -19,21 +19,6 @@ use crate::SkiaSharedContext;
 
 #[cfg(target_family = "windows")]
 mod dx12;
-
-/// Whether the window's text should use LCD coverage. True on Windows when
-/// ClearType is on. A layer must not: it is composited later, and LCD
-/// coverage fringes there. Read from the desk, not from the canvas —
-/// `SkCanvas::getTopProps` faults on the window's canvas.
-pub fn window_text_is_lcd() -> bool {
-    #[cfg(target_family = "windows")]
-    {
-        dx12::system_text_props().is_some()
-    }
-    #[cfg(not(target_family = "windows"))]
-    {
-        false
-    }
-}
 #[cfg(target_vendor = "apple")]
 mod metal;
 #[cfg(skia_wgpu_vulkan)]

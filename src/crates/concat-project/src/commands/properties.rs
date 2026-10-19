@@ -62,6 +62,9 @@ pub(super) fn apply(
                 let crop = crop.map(Crop::tidy).filter(|crop| !crop.is_none());
                 applied |= assign(&mut clip.crop, crop);
             }
+            if let Some(mask) = patch.mask {
+                applied |= assign(&mut clip.mask, mask.map(ClipMask::tidy));
+            }
             if let Some(filters) = patch.filters {
                 applied |= assign(&mut clip.filters, filters);
             }
@@ -80,6 +83,9 @@ pub(super) fn apply(
             }
             if let Some(stream) = patch.audio_stream {
                 applied |= assign(&mut clip.audio_stream, stream);
+            }
+            if let Some(background) = patch.background {
+                applied |= assign(&mut clip.background, background.map(Background::tidy));
             }
             Ok(Outcome {
                 created_id: None,
@@ -137,6 +143,23 @@ pub(super) fn apply(
             })
         }
 
+        Command::SetClipStabilize { clip_id, stabilize } => {
+            let timeline = project.active_mut();
+            let Some(clip) = timeline.clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            // Only footage has a camera that moved: a still, a title, a
+            // shape or a layer has nothing to steady.
+            if clip.kind != ClipKind::Video && stabilize.is_some() {
+                return Ok(Outcome::default());
+            }
+            let applied = assign(&mut clip.stabilize, stabilize.map(Stabilize::tidy));
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
         Command::AddCutoutStroke { clip_id, stroke } => {
             let timeline = project.active_mut();
             let Some(clip) = timeline.clip_mut(&clip_id) else {
@@ -180,6 +203,7 @@ pub(super) fn apply(
                 // same value at a different instant.
                 KeyProperty::Volume => value.max(0.0),
                 KeyProperty::OffsetX | KeyProperty::OffsetY | KeyProperty::Rotation => value,
+                mask => ClipMask::clamp(mask, value),
             };
             let before = clip.keys.clone();
             clip.set_key(property, at, value, ease);
@@ -341,6 +365,41 @@ pub(super) fn apply(
             Ok(Outcome {
                 created_id: None,
                 applied,
+            })
+        }
+
+        Command::FrameClip {
+            clip_id,
+            framing,
+            at,
+        } => {
+            let timeline = project.active();
+            let frame = (timeline.video.width, timeline.video.height);
+            let Some(media) = timeline
+                .clip(&clip_id)
+                .and_then(|clip| project.media_by_id(&clip.media_id))
+                .map(|item| (item.width, item.height))
+            else {
+                return Ok(Outcome::default());
+            };
+            let Some(clip) = project.active_mut().clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            let at = at.clamp(0.0, 1.0);
+            let Some(scale) = clip.framing_scale(framing, media, frame, at) else {
+                return Ok(Outcome::default());
+            };
+            let before = clip.clone();
+            clip.write_at(KeyProperty::Scale, scale, at);
+            clip.write_at(KeyProperty::OffsetX, 0.0, at);
+            clip.write_at(KeyProperty::OffsetY, 0.0, at);
+            // A stretch is a picture pulled out of its shape, and neither a
+            // fit nor a fill is: both are the picture as it was shot.
+            clip.stretch_x = 1.0;
+            clip.stretch_y = 1.0;
+            Ok(Outcome {
+                created_id: None,
+                applied: *clip != before,
             })
         }
 

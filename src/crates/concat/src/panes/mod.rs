@@ -16,12 +16,14 @@
 
 pub mod captions;
 pub mod export;
+pub mod glide;
 pub mod media_bin;
 pub mod monitor;
 pub mod pace;
 pub mod project;
 pub mod relink;
 pub mod settings;
+pub mod sounds;
 pub mod speech;
 pub mod start;
 pub mod timeline;
@@ -52,6 +54,8 @@ pub enum Msg {
     Timeline(timeline::TimelineMsg),
     /// To the voiceover take.
     Voiceover(voiceover::VoiceoverMsg),
+    /// To the library's Audio page.
+    Sounds(sounds::SoundsMsg),
 }
 
 /// What a message says in the log: the activity trail of what the person

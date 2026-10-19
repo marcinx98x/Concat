@@ -24,7 +24,9 @@ pub mod chains;
 pub mod flatten;
 mod resolve;
 
-use resolve::{BuiltTimeline, TransitionSpan, Treatment, animation_of, build_timeline, quantise};
+use resolve::{
+    BuiltTimeline, TransitionSpan, Treatment, animation_of, build_timeline, quantise, quantise_at,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ use concat_media::audio::{self, AudioClip};
 use concat_media::{
     DecodeOptions, Decoder, EncodeOptions, Encoder, FrameSink, FrameSource, RateMode, VideoCodec,
 };
-use concat_project::model::{AppliedFilter, ColorSpace, Cutout};
+use concat_project::model::{AppliedFilter, ClipMask, ColorSpace, Cutout};
 use concat_render::{
     Compositor, FramePlan, PlannedLayer, PlannedTreatment, Transition, WgpuCompositor, plan_frame,
 };
@@ -182,8 +184,8 @@ pub struct ExportClip {
     #[serde(default)]
     pub video_fade_in: f64,
     /// One frame - the one at `source_start` - held for the clip's length.
-    /// Set by transition resolution for the pre-roll of a clip with no
-    /// footage before its in-point, never by the UI; see [`pre_roll`].
+    /// Set by transition resolution where the outgoing clip of a cut has no
+    /// footage after its out-point, never by the UI; see [`overlap`].
     #[serde(skip)]
     pub hold: bool,
     /// The source's pixel width, when the UI knows it. What makes an
@@ -194,6 +196,12 @@ pub struct ExportClip {
     /// The source's pixel height; see `media_width`.
     #[serde(default)]
     pub media_height: Option<u32>,
+    /// The source's length in seconds, when the UI knows it: how much
+    /// footage lies past the clip's out-point for a transition to run the
+    /// clip on into. Absent, a transition holds the clip's last frame
+    /// instead.
+    #[serde(default)]
+    pub media_duration: Option<f64>,
     /// Whether the file carries an audio stream, when the UI knows (the
     /// document records it at import). Absent falls back to probing, so an
     /// older caller still exports correctly - just slower to start.
@@ -204,6 +212,10 @@ pub struct ExportClip {
     /// leaves the picture whole.
     #[serde(default)]
     pub cutout: Option<Cutout>,
+    /// The shape that keeps part of the picture, as the document holds
+    /// it; its keyed numbers ride in `animation` as `maskX` and on.
+    #[serde(default)]
+    pub mask: Option<ClipMask>,
     /// Draw the cutout tinted over the whole picture instead of cutting
     /// it: the view while the clip's brushes are in use. Preview only.
     #[serde(default)]
@@ -212,12 +224,69 @@ pub struct ExportClip {
     /// - or empty when the flattener had no project folder to name it by.
     #[serde(default)]
     pub mask_dir: String,
+    /// The camera's shake taken out, as the document holds it. Rendered
+    /// only with `motion_dir`: a clip whose movement is not measured yet
+    /// shows as shot.
+    #[serde(default)]
+    pub stabilize: Option<concat_project::model::Stabilize>,
+    /// Where this clip's media has its measured movement - see
+    /// `concat_vision::stabilize::motion_dir` - or empty when the
+    /// flattener had no project folder to name it by.
+    #[serde(default)]
+    pub motion_dir: String,
     /// A title's per-word reveal order, baked at rasterize time and set by
     /// the host - never by the wire format, like `transition_chain`. Every
     /// shader pass over this clip carries it, so a reveal effect can read
     /// it back through `reveal_order()`.
     #[serde(skip)]
     pub reveal_map: Option<Arc<RevealMap>>,
+    /// What fills the frame behind the picture where it does not reach, as
+    /// the flattener resolved it - the clip's own background or its
+    /// timeline's, for a picture on the lowest picture lane; absent for
+    /// black and for every other clip. See `Timeline::background_of`.
+    #[serde(default)]
+    pub backdrop: Option<ExportBackdrop>,
+}
+
+/// A clip's background, resolved for drawing: the document's
+/// `Background` with its colour read and its still found in the bin.
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ExportBackdrop {
+    /// The clip's own picture, enlarged to cover the frame and blurred.
+    Blur {
+        /// How soft, `0..=1`: a Gaussian of a twelfth of the frame's
+        /// shorter side at one.
+        amount: f64,
+    },
+    /// One opaque colour.
+    Colour {
+        /// Its channels.
+        rgb: [u8; 3],
+    },
+    /// A still, enlarged to cover the frame.
+    Image {
+        /// The file.
+        path: String,
+        /// Its pixel width, where the bin knows it: what it is decoded at.
+        width: Option<u32>,
+        /// Its pixel height.
+        height: Option<u32>,
+    },
+}
+
+impl ExportBackdrop {
+    /// The blur's spread, in pixels of a `width` by `height` frame, at
+    /// `amount`: a twelfth of the shorter side at the most, so the same
+    /// amount is the same softness at every size the frame is drawn at -
+    /// the monitor's quarter and the export's whole alike.
+    pub fn sigma(amount: f64, width: u32, height: u32) -> f32 {
+        (amount.clamp(0.0, 1.0) * f64::from(width.min(height)) / 12.0) as f32
+    }
 }
 
 impl ExportClip {
@@ -263,11 +332,16 @@ impl ExportClip {
             hold: false,
             media_width: None,
             media_height: None,
+            media_duration: None,
             has_audio: None,
             cutout: None,
+            mask: None,
             mask_dir: String::new(),
+            stabilize: None,
+            motion_dir: String::new(),
             highlighted: false,
             reveal_map: None,
+            backdrop: None,
         }
     }
 }
@@ -276,7 +350,9 @@ impl ExportClip {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportKey {
-    /// "scale", "offsetX", "offsetY", "rotation", "opacity" or "volume".
+    /// "scale", "offsetX", "offsetY", "rotation", "opacity" or "volume",
+    /// or one of the mask's numbers: "maskX", "maskY", "maskWidth",
+    /// "maskHeight", "maskRotation", "maskRoundness", "maskFeather".
     pub property: String,
     /// Where in the clip, `0..=1`.
     pub at: f64,
@@ -365,6 +441,11 @@ pub struct ExportRequest {
     /// say.
     #[serde(default)]
     pub hdr: bool,
+    /// Original timeline origin when rendering a selection moved to zero.
+    /// Preserves the global video frame grid and shader clock; audio, clip
+    /// clocks and keyframe fractions keep their local timing.
+    #[serde(default)]
+    pub effect_time_offset: f64,
     /// The flattened clip list to render.
     pub clips: Vec<ExportClip>,
 }
@@ -515,10 +596,11 @@ pub(crate) fn transitions_at(shapes: &[TransitionShape], frame: i64) -> Vec<Tran
 /// collected before anything mutates, so resolving one transition cannot
 /// unhook the adjacency test of the next.
 ///
-/// Every kind but the fades to a colour is built on one overlap: the
-/// incoming clip extends backwards over the outgoing one by the transition's
-/// length, on the lane above, showing the handle before its in-point. What
-/// differs is how the two are blended across that overlap - a dissolve
+/// Every kind but the fades to a colour is built on one overlap, centred on
+/// the cut the way the timeline draws it: the incoming clip extends
+/// backwards by half the transition's length, on the lane above, showing
+/// the handle before its in-point, and the outgoing one runs on under it by
+/// the other half, past its out-point (see [`overlap`]). What differs is how the two are blended across that overlap - a dissolve
 /// ramps the incoming clip's opacity, a push slides both, a zoom scales
 /// both under a dissolve, a wipe uncovers the incoming one behind a moving
 /// edge. The slides and scales are keys on the clips' animations, which
@@ -533,6 +615,14 @@ pub(crate) fn transitions_at(shapes: &[TransitionShape], frame: i64) -> Vec<Tran
 /// path, so a project saved before packaged transitions existed renders
 /// exactly as it always did.
 fn resolve_transitions(clips: &mut Vec<ExportClip>, rate: FrameRate) -> Vec<TransitionSpan> {
+    resolve_transitions_at(clips, rate, 0.0)
+}
+
+fn resolve_transitions_at(
+    clips: &mut Vec<ExportClip>,
+    rate: FrameRate,
+    origin: f64,
+) -> Vec<TransitionSpan> {
     for clip in clips.iter_mut() {
         clip.track *= 2;
     }
@@ -572,23 +662,31 @@ fn resolve_transitions(clips: &mut Vec<ExportClip>, rate: FrameRate) -> Vec<Tran
     for cut in cuts {
         match cut.kind.as_str() {
             "cross-fade" | "push" | "zoom" | "wipe-left" | "wipe-right" => {
-                // The picture before the cut on the lane above: the
-                // incoming clip itself, or its first frame held.
-                let Some((incoming, d)) = pre_roll(clips, &cut, frame) else {
+                // The two pictures across the cut: the incoming clip on the
+                // lane above, the outgoing one running on beneath it.
+                let Some(Overlap {
+                    incoming,
+                    length: d,
+                    outgoing_runs,
+                }) = overlap(clips, &cut, frame)
+                else {
                     continue;
                 };
 
                 // How the two blend across the overlap. A shape that cannot
                 // be applied - a clip the user has already keyed on the
-                // property the shape would ride - falls back to the dissolve
-                // rather than half-applying, so the cut still transitions.
+                // property the shape would ride, or an outgoing picture that
+                // is a held frame rather than the clip a key could move -
+                // falls back to the dissolve rather than half-applying, so
+                // the cut still transitions.
                 let shaped = match cut.kind.as_str() {
                     // The new picture slides in from the right and shoves the
                     // old one out to the left, edge to edge: both ride the
                     // same ease over the same seconds, which is what keeps
                     // them glued.
                     "push" => {
-                        rides(clips, cut.outgoing, incoming, "offsetX")
+                        outgoing_runs
+                            && rides(clips, cut.outgoing, incoming, "offsetX")
                             && ride(
                                 &mut clips[incoming],
                                 "offsetX",
@@ -611,7 +709,8 @@ fn resolve_transitions(clips: &mut Vec<ExportClip>, rate: FrameRate) -> Vec<Tran
                     // The old picture grows as it dissolves into the new one,
                     // which settles from a little large to its own size.
                     "zoom" => {
-                        rides(clips, cut.outgoing, incoming, "scale")
+                        outgoing_runs
+                            && rides(clips, cut.outgoing, incoming, "scale")
                             && ride(&mut clips[incoming], "scale", 1.25, 1.0, d, true, EASE_OUT)
                             && ride(
                                 &mut clips[cut.outgoing],
@@ -684,14 +783,19 @@ fn resolve_transitions(clips: &mut Vec<ExportClip>, rate: FrameRate) -> Vec<Tran
                 .get(kind)
                 .is_some_and(|package| package.transition().is_some()) =>
             {
-                let Some((incoming, d)) = pre_roll(clips, &cut, frame) else {
+                let Some(Overlap {
+                    incoming,
+                    length: d,
+                    ..
+                }) = overlap(clips, &cut, frame)
+                else {
                     continue;
                 };
                 let b = &mut clips[incoming];
                 // The dissolve a GPU-less path shows; the shader's own blend
                 // overrides it where a GPU runs the transition.
                 b.video_fade_in = d;
-                let start = quantise(b.start, rate);
+                let start = quantise_at(b.start, rate, origin);
                 let end = start + quantise(d, rate);
                 spans.push(TransitionSpan {
                     start,
@@ -719,57 +823,146 @@ struct Cut {
     duration: f64,
 }
 
-/// The overlap a transition crosses: the picture shown on the lane above
-/// the outgoing clip for the transition's length before the cut. Returns
-/// the index of the clip that is that overlap, and the length, which is
-/// capped by both clips; `None` for a cut too short to overlap at all.
+/// What [`overlap`] built a transition on.
+struct Overlap {
+    /// The incoming clip, moved to the lane above the outgoing one and
+    /// starting where the overlap does.
+    incoming: usize,
+    /// The overlap's length: the transition's, capped by both clips.
+    length: f64,
+    /// The outgoing clip itself runs on under the overlap. False when a
+    /// held copy of its last frame does instead, which a key on the clip
+    /// cannot move.
+    outgoing_runs: bool,
+}
+
+/// The overlap a transition crosses, centred on the cut the way the
+/// timeline draws it: the incoming clip on the lane above, from half the
+/// transition's length before the cut, over the outgoing one running on
+/// for the other half past it. The length is capped by both clips; `None`
+/// for a cut too short to overlap at all.
 ///
-/// The overlap is the incoming clip itself, extended backwards with its
-/// source clock wound back the same way, when it has that much footage
-/// before its in-point - a still always has. Without that handle the clip
-/// is left exactly where the cut put it, and a copy of its first frame is
-/// held on the lane above for the transition's length instead: the
-/// "repeated frames" every editor shows over a cut with no handle. Winding
-/// the start back without the clock, as this once did, played everything
-/// after the cut early and ran the last of it off the file's end into
-/// black (#236). The hold is the clip with no sound, no keys and no fades
-/// of its own, so the picture coming in is the one the clip then plays;
-/// a keyed placement is held where its ride has it at the clip's head.
-fn pre_roll(clips: &mut Vec<ExportClip>, cut: &Cut, frame: f64) -> Option<(usize, f64)> {
-    let (a_track, a_duration) = {
-        let a = &clips[cut.outgoing];
-        (a.track, a.duration)
-    };
+/// Each side is the clip itself, extended with its source clock moved the
+/// same way, into footage the edit left out: before the incoming clip's
+/// in-point, after the outgoing one's out-point - a still has all it needs
+/// either way. Winding a start back without the clock, as this once did,
+/// played everything after the cut early and ran the last of it off the
+/// file's end into black (#236).
+///
+/// Without footage after its out-point, the outgoing clip ends at the cut
+/// and a copy of its last frame is held beneath for the rest: the
+/// "repeated frames" every editor shows over a cut with no handle. The
+/// hold is the clip with no sound, no keys and no fades of its own; a
+/// keyed placement is held where its ride leaves it at the clip's tail.
+/// The incoming side gets no hold, as one there would end at the cut and
+/// leave the clip after it sharing a lane with the outgoing picture: what
+/// it lacks before its in-point moves to after the cut instead, so the
+/// transition leans later rather than freezing.
+fn overlap(clips: &mut Vec<ExportClip>, cut: &Cut, frame: f64) -> Option<Overlap> {
+    let a = &clips[cut.outgoing];
     let b = &clips[cut.incoming];
-    let d = cut.duration.min(a_duration).min(b.duration);
-    if d < frame {
+    let length = cut.duration.min(a.duration).min(b.duration);
+    if length < frame {
         return None;
     }
-    // Footage before the in-point, in timeline seconds.
-    let handle = if b.kind == ClipKind::Image {
-        d
-    } else {
-        b.source_start / b.speed.max(f64::EPSILON)
-    };
-    if handle + frame / 2.0 >= d {
-        let b = &mut clips[cut.incoming];
-        b.start -= d;
-        b.duration += d;
-        if b.kind != ClipKind::Image {
-            b.source_start = (b.source_start - d * b.speed).max(0.0);
-        }
-        // Sound rides the picture: the pre-roll fades in rather than
-        // arriving at full level a dissolve early.
-        b.fade_in = b.fade_in.max(d);
-        b.track = a_track + 1;
-        return Some((cut.incoming, d));
+    let mut lead = (length / 2.0).min(head_handle(b));
+    if lead < frame / 2.0 {
+        lead = 0.0;
     }
+    let tail = length - lead;
+    let a_track = a.track;
+    let a_end = a.start + a.duration;
+    let outgoing_runs = tail_handle(a, frame) + frame / 2.0 >= tail;
 
-    let mut hold = b.clone();
+    {
+        let b = &mut clips[cut.incoming];
+        extend(b, lead, 0.0);
+        // Sound rides the picture: each side fades across the overlap
+        // rather than arriving or leaving at full level.
+        b.fade_in = b.fade_in.max(length);
+        b.track = a_track + 1;
+    }
+    if outgoing_runs {
+        let a = &mut clips[cut.outgoing];
+        extend(a, 0.0, tail);
+        a.fade_out = a.fade_out.max(length);
+    } else {
+        let hold = last_frame_held(&clips[cut.outgoing], a_end, tail, frame);
+        clips.push(hold);
+    }
+    Some(Overlap {
+        incoming: cut.incoming,
+        length,
+        outgoing_runs,
+    })
+}
+
+/// Footage before `clip`'s in-point, in timeline seconds. A clip whose
+/// speed rides a curve has none to offer: its source clock is the curve's,
+/// which says nothing about before its start.
+fn head_handle(clip: &ExportClip) -> f64 {
+    if clip.kind == ClipKind::Image {
+        f64::INFINITY
+    } else if !clip.speed_curve.is_empty() {
+        0.0
+    } else {
+        clip.source_start / clip.speed.max(f64::EPSILON)
+    }
+}
+
+/// Footage after `clip`'s out-point, in timeline seconds, a frame short of
+/// the length the file declares so a container that rounds up is not read
+/// past its last picture. Nothing where the length is unknown, or where a
+/// curve sets the clock.
+fn tail_handle(clip: &ExportClip, frame: f64) -> f64 {
+    if clip.kind == ClipKind::Image {
+        return f64::INFINITY;
+    }
+    if !clip.speed_curve.is_empty() {
+        return 0.0;
+    }
+    clip.media_duration.map_or(0.0, |length| {
+        let speed = clip.speed.max(f64::EPSILON);
+        ((length - clip.source_start) / speed - clip.duration - frame).max(0.0)
+    })
+}
+
+/// Lengthens `clip` by `head` seconds before its start and `tail` after
+/// its end, its source clock moved with it. Keys sit at fractions of the
+/// clip, so each is moved to stay at the instant it was at.
+fn extend(clip: &mut ExportClip, head: f64, tail: f64) {
+    if head <= 0.0 && tail <= 0.0 {
+        return;
+    }
+    let old = clip.duration;
+    let new = old + head + tail;
+    if old > 0.0 {
+        for key in &mut clip.animation {
+            key.at = (key.at * old + head) / new;
+        }
+    }
+    clip.start -= head;
+    clip.duration = new;
+    if clip.kind != ClipKind::Image {
+        clip.source_start = (clip.source_start - head * clip.speed).max(0.0);
+    }
+}
+
+/// A copy of `clip`'s last frame held from `start` for `length` seconds,
+/// on its lane: silent, unkeyed and unfaded, placed where its keys leave
+/// it at its tail.
+fn last_frame_held(clip: &ExportClip, start: f64, length: f64, frame: f64) -> ExportClip {
+    let mut hold = clip.clone();
     hold.hold = true;
-    hold.start = b.start - d;
-    hold.duration = d;
-    hold.track = a_track + 1;
+    hold.start = start;
+    hold.duration = length;
+    if clip.kind != ClipKind::Image {
+        let (played, rate) = match SpeedCurve::new(&clip.speed_curve) {
+            Some(curve) => (clip.duration * curve.consumed(1.0), curve.speed_at(1.0)),
+            None => (clip.duration * clip.speed, clip.speed),
+        };
+        hold.source_start = clip.source_start + (played - frame * rate).max(0.0);
+    }
     hold.speed = 1.0;
     hold.speed_curve.clear();
     hold.muted = true;
@@ -781,19 +974,19 @@ fn pre_roll(clips: &mut Vec<ExportClip>, cut: &Cut, frame: f64) -> Option<(usize
     hold.video_fade_in = 0.0;
     hold.transition_shapes.clear();
     // Keys are absolute and a keyed property's constant is the neutral
-    // value, so the head of each ride becomes the hold's constant.
-    let heads: Vec<(String, f64)> = ["scale", "offsetX", "offsetY", "rotation", "opacity"]
+    // value, so the tail of each ride becomes the hold's constant.
+    let tails: Vec<(String, f64)> = ["scale", "offsetX", "offsetY", "rotation", "opacity"]
         .into_iter()
         .filter_map(|property| {
             hold.animation
                 .iter()
                 .filter(|key| key.property == property)
-                .min_by(|a, b| a.at.total_cmp(&b.at))
+                .max_by(|a, b| a.at.total_cmp(&b.at))
                 .map(|key| (property.to_owned(), key.value))
         })
         .collect();
     hold.animation.clear();
-    for (property, value) in heads {
+    for (property, value) in tails {
         match property.as_str() {
             "scale" => hold.scale = value,
             "offsetX" => hold.offset_x = value,
@@ -803,8 +996,7 @@ fn pre_roll(clips: &mut Vec<ExportClip>, cut: &Cut, frame: f64) -> Option<(usize
             _ => {}
         }
     }
-    clips.push(hold);
-    Some((clips.len() - 1, d))
+    hold
 }
 
 /// The timing functions the transition shapes ride on, as `ExportKey` holds
@@ -883,6 +1075,11 @@ pub fn render_on(
     compositor: Option<WgpuCompositor>,
     mut reporter: Reporter<'_>,
 ) -> Result<String, String> {
+    if !request.effect_time_offset.is_finite()
+        || request.effect_time_offset.abs() > concat_project::model::ranges::MAX_TIME
+    {
+        return Err("the effect timeline offset is not a valid time".into());
+    }
     if request.clips.is_empty() {
         return Err("there is nothing on the timeline to export".to_owned());
     }
@@ -912,7 +1109,7 @@ pub fn render_on(
     // else reads the clip list, so the picture and sound paths below never
     // know transitions exist.
     let mut resolved = request.clips.clone();
-    let transitions = resolve_transitions(&mut resolved, rate);
+    let transitions = resolve_transitions_at(&mut resolved, rate, request.effect_time_offset);
 
     // Stills composite exactly like footage; they only differ in how they are
     // decoded, which is handled where the decoder is opened.
@@ -1135,7 +1332,8 @@ pub fn audio_pieces(clip: &ExportClip) -> Vec<AudioClip> {
 
 /// The plan's layer for one clip at one instant, filled in: the picture
 /// decoded, its effects resolved, on its track, and its crop and flips
-/// where the plan draws them (`geometry`; see `resolve::planned_geometry`).
+/// where the plan draws them (`geometry`; see `resolve::planned_geometry`),
+/// and its stabilization's correction at the frame it shows.
 /// A clip without planned geometry has them baked in by the decoder's
 /// chain, as the transition fades still are, and the cutout has already
 /// cut the picture either way.
@@ -1146,6 +1344,7 @@ fn filled(
     effects: Vec<ShaderPass>,
     geometry: Option<&resolve::PlannedGeometry>,
     transitions: Vec<Transition>,
+    stabilized: Option<&resolve::StabilizeJob>,
 ) -> PlannedLayer {
     let mut filled = PlannedLayer {
         source: Some(frame),
@@ -1154,6 +1353,9 @@ fn filled(
         transitions,
         ..layer.clone()
     };
+    if let Some(job) = stabilized {
+        filled.warp = job.warp_at(layer.source_time);
+    }
     if let Some(geometry) = geometry {
         filled.crop = geometry.crop;
         filled.flip_h = geometry.flip_h;
@@ -1176,6 +1378,89 @@ fn shapes_at(
         }
         None => Vec::new(),
     }
+}
+
+/// `layers` with every picture's background beneath it, in a `width` by
+/// `height` frame: the one place the export and the monitor both put
+/// backgrounds in, so the two cannot draw them two ways. A picture that
+/// already hides the whole frame gets none - `opaque` says whose pixels
+/// have no holes to see one through - and a still that cannot be read is
+/// no background rather than a failed frame.
+fn with_backdrops(
+    layers: Vec<PlannedLayer>,
+    backdrops: &HashMap<ClipId, ExportBackdrop>,
+    opaque: impl Fn(ClipId) -> bool,
+    pool: &concat_media::ReaderPool,
+    (width, height): (u32, u32),
+) -> Vec<PlannedLayer> {
+    if backdrops.is_empty() {
+        return layers;
+    }
+    let mut out = Vec::with_capacity(layers.len() + 1);
+    for layer in layers {
+        let drawn = backdrops
+            .get(&layer.clip)
+            .filter(|_| !layer.covers(width, height, opaque(layer.clip)))
+            .and_then(|backdrop| backdrop_of(backdrop, pool, (width, height)))
+            .and_then(|backdrop| layer.backdrop(&backdrop, width, height, blur_pass));
+        out.extend(drawn);
+        out.push(layer);
+    }
+    out
+}
+
+/// A clip's background as the frame plan draws it, at a `width` by
+/// `height` frame: the blur's spread in that frame's pixels, a still read
+/// through the pool at a size that covers it.
+fn backdrop_of(
+    backdrop: &ExportBackdrop,
+    pool: &concat_media::ReaderPool,
+    (width, height): (u32, u32),
+) -> Option<concat_render::Backdrop> {
+    match backdrop {
+        ExportBackdrop::Blur { amount } => Some(concat_render::Backdrop::Blur {
+            sigma: ExportBackdrop::sigma(*amount, width, height),
+        }),
+        ExportBackdrop::Colour { rgb } => Some(concat_render::Backdrop::Colour(*rgb)),
+        ExportBackdrop::Image {
+            path,
+            width: still_width,
+            height: still_height,
+        } => {
+            // Read at the size that covers the frame, its own shape kept;
+            // the frame's when the bin never learnt the still's.
+            let size = match (still_width, still_height) {
+                (Some(w), Some(h)) if *w > 0 && *h > 0 => {
+                    let cover =
+                        (f64::from(width) / f64::from(*w)).max(f64::from(height) / f64::from(*h));
+                    (
+                        ((f64::from(*w) * cover).round() as u32).max(2),
+                        ((f64::from(*h) * cover).round() as u32).max(2),
+                    )
+                }
+                _ => (width, height),
+            };
+            let request = concat_media::FrameRequest::new(path, Rational::ZERO, size.0, size.1)
+                .as_still(true)
+                .at_any_size(true);
+            match pool.frame(&request) {
+                Ok(still) => Some(concat_render::Backdrop::Image(still)),
+                Err(error) => {
+                    log::debug!("background image {path}: {error}");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The Gaussian blur's pass at `radius` pixels: the package every blurred
+/// background is drawn with, so it blurs exactly as the effect does.
+fn blur_pass(radius: f32) -> Option<ShaderPass> {
+    Catalogue::builtin().get("concat.gaussian-blur")?.pass(
+        &BTreeMap::from([("radius".to_owned(), f64::from(radius))]),
+        None,
+    )
 }
 
 /// A stack already drawn, as a layer over the whole frame on the lowest
@@ -1305,6 +1590,7 @@ fn render_picture(
     destination: &Path,
     reporter: &mut Reporter<'_>,
 ) -> Result<(), String> {
+    let effect_offset = quantise(request.effect_time_offset, rate);
     let mut compositor = match compositor {
         Some(lent) => lent,
         None => best_compositor()?,
@@ -1340,7 +1626,9 @@ fn render_picture(
         chains,
         reveal_maps,
         cutouts,
+        stabilized,
         highlight: _,
+        backdrops,
     } = build_timeline(request, rate, visible, transitions);
 
     let options = EncodeOptions {
@@ -1434,6 +1722,7 @@ fn render_picture(
                     passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
                     geometry.get(&layer.clip),
                     shapes_at(&shapes, layer, time, rate),
+                    stabilized.get(&layer.clip),
                 ));
                 continue;
             }
@@ -1501,6 +1790,7 @@ fn render_picture(
                     passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
                     geometry.get(&layer.clip),
                     shapes_at(&shapes, layer, time, rate),
+                    stabilized.get(&layer.clip),
                 ));
             }
         }
@@ -1509,7 +1799,13 @@ fn render_picture(
             time,
             width: request.width,
             height: request.height,
-            layers,
+            layers: with_backdrops(
+                layers,
+                &backdrops,
+                |clip| !stills.contains(&clip) && !cutouts.contains_key(&clip),
+                &sought,
+                (request.width, request.height),
+            ),
             treatments: Vec::new(),
             output: output_of(request.color_space),
         };
@@ -1517,7 +1813,10 @@ fn render_picture(
         // that died under it is black, and is drawn again on the device
         // that takes over. The copy is cheap - the pictures are shared.
         let mut composed = composite_treated(
-            &mut compositor,
+            &mut EffectClock {
+                inner: &mut compositor,
+                offset: effect_offset,
+            },
             frame_plan.clone(),
             &treatments,
             &transitions,
@@ -1533,7 +1832,10 @@ fn render_picture(
             );
             compositor = recovered(losses, hdr)?;
             composed = composite_treated(
-                &mut compositor,
+                &mut EffectClock {
+                    inner: &mut compositor,
+                    offset: effect_offset,
+                },
                 frame_plan.clone(),
                 &treatments,
                 &transitions,
@@ -1590,6 +1892,46 @@ fn passes_at(
         .clip(clip)
         .map_or(0.0, |engine_clip| engine_clip.fraction_at(time));
     Catalogue::builtin().shader_passes_at(effects, at, reveal_maps.get(&clip).cloned())
+}
+
+/// Only the shader clock moves. Planning, source decoding, animated effect
+/// parameters and transition progress use the selection's local timeline.
+struct EffectClock<'a> {
+    inner: &'a mut dyn Compositor,
+    offset: Rational,
+}
+
+impl Compositor for EffectClock<'_> {
+    fn render(&mut self, plan: &FramePlan) -> Frame {
+        if self.offset == Rational::ZERO {
+            return self.inner.render(plan);
+        }
+        let mut shifted = plan.clone();
+        shifted.time += self.offset;
+        for layer in &mut shifted.layers {
+            layer.clip_start += self.offset;
+        }
+        self.inner.render(&shifted)
+    }
+
+    fn combine(
+        &mut self,
+        width: u32,
+        height: u32,
+        time: f32,
+        from: &Frame,
+        to: &Frame,
+        pass: &concat_core::shader::TransitionPass,
+    ) -> Option<Frame> {
+        self.inner.combine(
+            width,
+            height,
+            time + self.offset.as_f64() as f32,
+            from,
+            to,
+            pass,
+        )
+    }
 }
 
 /// Draws `plan` with every treatment live at its instant applied to the
@@ -1919,7 +2261,9 @@ pub fn preview_sources_of(
         chains,
         reveal_maps,
         cutouts,
+        stabilized,
         highlight,
+        backdrops,
     } = &plan.built;
     let highlight = *highlight;
     let time = quantise(seconds, rate);
@@ -1960,6 +2304,7 @@ pub fn preview_sources_of(
                     passes_at(chains, reveal_maps, timeline, layer.clip, time),
                     geometry.get(&layer.clip),
                     shapes_at(shapes, layer, time, rate),
+                    stabilized.get(&layer.clip),
                 ))
             }
             Err(error) => failures.push(format!("{}: {error}", layer.media.display())),
@@ -1981,7 +2326,13 @@ pub fn preview_sources_of(
         time,
         width: plan.width,
         height: plan.height,
-        layers,
+        layers: with_backdrops(
+            layers,
+            backdrops,
+            |clip| !stills.contains(&clip) && !cutouts.contains_key(&clip),
+            pool,
+            (plan.width, plan.height),
+        ),
         treatments: Vec::new(),
         output: plan.output,
     };
@@ -2059,6 +2410,7 @@ pub fn preview_plan(
         color_range: concat_media::ColorRange::Limited,
         color_space,
         hdr: false,
+        effect_time_offset: 0.0,
         clips: Vec::new(),
     };
     PreviewPlan {
@@ -2358,10 +2710,10 @@ mod tests {
                 .all(|(got, want)| (i16::from(*got) - i16::from(want)).abs() <= 40)
         };
         for (kind, time, x, want) in [
-            ("wipe-left", 1.5, 0.2, [220, 30, 30]),
-            ("wipe-left", 1.5, 0.8, [30, 30, 220]),
-            ("wipe-right", 1.5, 0.2, [30, 30, 220]),
-            ("wipe-right", 1.5, 0.8, [220, 30, 30]),
+            ("wipe-left", 2.0, 0.2, [220, 30, 30]),
+            ("wipe-left", 2.0, 0.8, [30, 30, 220]),
+            ("wipe-right", 2.0, 0.2, [30, 30, 220]),
+            ("wipe-right", 2.0, 0.8, [220, 30, 30]),
             ("fade-black", 2.0, 0.5, [0, 0, 0]),
         ] {
             let got = look(kind, time, x);
@@ -2557,6 +2909,177 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A fresh adjustment layer - the colour panel's package at its
+    /// defaults, laid over the footage through the command the library
+    /// uses - leaves the picture exactly as it was, on the monitor's plan
+    /// and through the export's compositing alike; graded, it changes the
+    /// picture and the two still agree (#249). Skips without FFmpeg or a
+    /// GPU.
+    #[test]
+    fn a_fresh_adjustment_layer_changes_nothing_on_the_monitor_or_in_the_export() {
+        use concat_core::frame::Frame;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+        use concat_project::commands::{ClipPatch, NewMedia};
+        use concat_project::model::MediaKind;
+        use concat_project::{Command, Editor};
+
+        let (width, height) = (64_u32, 64_u32);
+        let path = std::env::temp_dir().join(format!(
+            "concat-adjustment-layer-{}.mp4",
+            std::process::id()
+        ));
+        let Ok(mut encoder) = Encoder::create(
+            &path,
+            width,
+            height,
+            FrameRate::THIRTY,
+            &EncodeOptions {
+                crf: 12,
+                ..EncodeOptions::default()
+            },
+        ) else {
+            return; // no ffmpeg here
+        };
+        // Something in every channel at every level, so a grade that moved
+        // any of them would show.
+        let mut picture = Frame::black(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                picture.set_pixel(x, y, [(x * 4) as u8, (y * 4) as u8, 150, 255]);
+            }
+        }
+        for _ in 0..60 {
+            encoder.write_frame(&picture).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+        let Some(mut gpu) = WgpuCompositor::new() else {
+            let _ = std::fs::remove_file(&path);
+            return; // no renderer here
+        };
+
+        let mut editor = Editor::new();
+        let media_id = editor
+            .apply(Command::AddMedia {
+                item: NewMedia {
+                    path: path.to_string_lossy().into_owned(),
+                    name: "gradient.mp4".into(),
+                    duration: Some(2.0),
+                    kind: MediaKind::Video,
+                    width: Some(width),
+                    height: Some(height),
+                    frame_rate: None,
+                    frame_rate_fraction: None,
+                    video_codec: None,
+                    audio_codec: None,
+                    has_audio: false,
+                    audio_tracks: Vec::new(),
+                    origin: None,
+                    color_space: Default::default(),
+                },
+            })
+            .expect("adds media")
+            .created_id
+            .expect("an id");
+        let track_id = editor.project().timelines[0].tracks[0].id.clone();
+        editor
+            .apply(Command::AddClip {
+                media_id,
+                track_id,
+                start: 0.0,
+                ripple: false,
+            })
+            .expect("adds the footage");
+        let plain = flatten::flatten_timeline(editor.project(), None);
+        let layer_id = editor
+            .apply(Command::AddLayerClip {
+                track_id: None,
+                start: 0.0,
+                duration: Some(2.0),
+                effect_id: "concat.adjust".into(),
+                name: "Adjustment".into(),
+            })
+            .expect("adds the layer")
+            .created_id
+            .expect("an id");
+        let fresh = flatten::flatten_timeline(editor.project(), None);
+        assert!(
+            fresh
+                .iter()
+                .any(|clip| clip.kind == ClipKind::Layer && clip.track > 0),
+            "the layer is over the footage"
+        );
+
+        let pool = concat_media::ReaderPool::new(16 * 1024 * 1024, 2);
+        let request = |clips: Vec<ExportClip>| PreviewFrameRequest {
+            time: 1.0,
+            width,
+            height,
+            rate_num: 30,
+            rate_den: 1,
+            clips,
+            color_space: concat_project::model::ColorSpace::Sdr,
+        };
+        // The window draws the plan with every live treatment folded in;
+        // the export draws through `composite_treated`.
+        let mut both = |clips: Vec<ExportClip>| -> (Frame, Frame) {
+            let sources = preview_sources(&pool, &request(clips)).expect("previews");
+            let monitor = gpu.render(sources.plan());
+            let export = sources.composite(&mut gpu);
+            (monitor, export)
+        };
+        let furthest = |a: &Frame, b: &Frame| -> u8 {
+            a.pixels()
+                .iter()
+                .zip(b.pixels())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0)
+        };
+
+        let (before, before_export) = both(plain);
+        assert_eq!(furthest(&before, &before_export), 0, "untreated");
+        let (monitor, export) = both(fresh);
+        assert!(
+            furthest(&before, &monitor) <= 1,
+            "a fresh adjustment layer moved the monitor's picture by {}",
+            furthest(&before, &monitor)
+        );
+        assert!(
+            furthest(&before, &export) <= 1,
+            "a fresh adjustment layer moved the exported picture by {}",
+            furthest(&before, &export)
+        );
+
+        // A stop up: the picture changes, the same on both.
+        let mut graded = AppliedFilter::new("concat.adjust");
+        graded.params.insert("exposure".into(), 1.0);
+        editor
+            .apply(Command::UpdateClip {
+                clip_id: layer_id,
+                patch: ClipPatch {
+                    video_effects: Some(vec![graded]),
+                    ..ClipPatch::default()
+                },
+            })
+            .expect("grades the layer");
+        let (monitor, export) = both(flatten::flatten_timeline(editor.project(), None));
+        eprintln!(
+            "a stop up moves the picture by {} at most; monitor and export differ by {}",
+            furthest(&before, &monitor),
+            furthest(&monitor, &export)
+        );
+        assert!(
+            furthest(&before, &monitor) > 20,
+            "a stop up must show on the monitor"
+        );
+        assert!(
+            furthest(&monitor, &export) <= 1,
+            "the monitor and the export disagree by {}",
+            furthest(&monitor, &export)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A still keeps its own shape on the monitor: a portrait photograph
     /// in a square frame stands in the middle with the stage either side
     /// of it, not stretched across the frame (#229). Skips without FFmpeg.
@@ -2657,6 +3180,7 @@ mod tests {
             color_range: concat_media::ColorRange::Limited,
             color_space: ColorSpace::Sdr,
             hdr: false,
+            effect_time_offset: 0.0,
             clips: vec![footage],
         };
         assert!(!nested.exists());
@@ -2737,6 +3261,7 @@ mod tests {
             color_range: concat_media::ColorRange::Limited,
             color_space: ColorSpace::Sdr,
             hdr: false,
+            effect_time_offset: 0.0,
             clips: vec![footage],
         };
         let cancel = AtomicBool::new(false);
@@ -2793,26 +3318,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_cross_fade_overlaps_the_incoming_clip_on_its_own_lane() {
+    /// Two clips cut at 4 s on one track, the incoming one with two
+    /// seconds of footage before its in-point and the outgoing one with
+    /// six past its out-point, unless a test takes them away.
+    fn cut_with_handles() -> Vec<ExportClip> {
         let mut clips = vec![
             clip("video", 0, 0.0, 4.0, 0.0),
             clip("video", 0, 4.0, 4.0, 2.0),
         ];
+        clips[0].media_duration = Some(10.0);
+        clips
+    }
+
+    #[test]
+    fn a_cross_fade_is_centred_on_the_cut() {
+        let mut clips = cut_with_handles();
         clips[1].transition = spec("cross-fade", 1.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
 
         let b = &clips[1];
-        assert_eq!(b.start, 3.0, "extends backwards over the cut");
-        assert_eq!(b.duration, 5.0);
+        assert_eq!(b.start, 3.5, "starts half the transition before the cut");
+        assert_eq!(b.duration, 4.5);
         assert_eq!(
-            b.source_start, 1.0,
+            b.source_start, 1.5,
             "consumes the handle before the in-point"
         );
         assert_eq!(b.video_fade_in, 1.0);
         assert_eq!(b.fade_in, 1.0, "sound rides the picture");
-        assert_eq!(clips[0].track, 0, "outgoing stays on its doubled lane");
-        assert_eq!(b.track, 1, "incoming sits directly above it");
+        assert_eq!(b.track, 1, "incoming sits directly above the outgoing clip");
+
+        let a = &clips[0];
+        assert_eq!(
+            (a.start, a.duration, a.source_start),
+            (0.0, 4.5, 0.0),
+            "runs on half the transition past the cut"
+        );
+        assert_eq!(a.fade_out, 1.0, "and its sound fades out across it");
+        assert_eq!(a.track, 0, "outgoing stays on its doubled lane");
+        assert_eq!(clips.len(), 2, "no hold: both sides have footage");
+    }
+
+    /// A clip lengthened for a transition keeps its keys at the instants
+    /// they were at, although a key's place is a fraction of the clip.
+    #[test]
+    fn an_extended_clip_keeps_its_keys_where_they_were() {
+        let mut clips = cut_with_handles();
+        for (n, at) in [1.0, 0.0].into_iter().enumerate() {
+            clips[n].animation.push(ExportKey {
+                property: "scale".to_owned(),
+                at,
+                value: 2.0,
+                ease: linear_ease(),
+            });
+        }
+        clips[1].transition = spec("cross-fade", 1.0);
+        resolve_transitions(&mut clips, FrameRate::THIRTY);
+        assert_eq!(keys_on(&clips[0], "scale"), vec![(4.0 / 4.5, 2.0)]);
+        assert_eq!(keys_on(&clips[1], "scale"), vec![(0.5 / 4.5, 2.0)]);
     }
 
     #[test]
@@ -2820,147 +3382,126 @@ mod tests {
         // A transition named by its package id (not one of the seven legacy
         // strings) takes the new path: the same overlap a dissolve gets, plus
         // a `TransitionSpan` for the compositor to combine over.
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 2.0),
-        ];
+        let mut clips = cut_with_handles();
         clips[1].transition = spec("concat.dissolve", 1.0);
         let spans = resolve_transitions(&mut clips, FrameRate::THIRTY);
 
         let b = &clips[1];
-        assert_eq!(
-            b.start, 3.0,
-            "extends backwards over the cut, like a dissolve"
-        );
-        assert_eq!(b.duration, 5.0);
+        assert_eq!(b.start, 3.5, "centred on the cut, like a dissolve");
+        assert_eq!(b.duration, 4.5);
         assert_eq!(b.video_fade_in, 1.0, "the GPU-less fallback dissolve");
         assert_eq!(b.track, 1);
+        assert_eq!(clips[0].duration, 4.5);
 
         assert_eq!(spans.len(), 1, "one packaged transition over the cut");
         let span = &spans[0];
         assert_eq!(span.id, "concat.dissolve");
         assert_eq!(span.to_track, 1, "the incoming clip's own lane");
-        assert_eq!(span.start, Rational::from_int(3));
-        assert_eq!(span.end, Rational::from_int(4));
-        assert!((span.progress(Rational::from_int(3)) - 0.0).abs() < 1e-9);
-        assert!((span.progress(Rational::new(35, 10)) - 0.5).abs() < 1e-9);
-        assert!((span.progress(Rational::from_int(4)) - 1.0).abs() < 1e-9);
+        assert_eq!(span.start, Rational::new(7, 2));
+        assert_eq!(span.end, Rational::new(9, 2));
+        assert!((span.progress(Rational::new(7, 2)) - 0.0).abs() < 1e-9);
+        assert!((span.progress(Rational::from_int(4)) - 0.5).abs() < 1e-9);
+        assert!((span.progress(Rational::new(9, 2)) - 1.0).abs() < 1e-9);
     }
 
-    /// A clip with less footage before its in-point than the transition
-    /// is long keeps its place and its clock - winding the start back
-    /// without the clock played everything after the cut early and ran
-    /// the end off the file into black (#236) - and its first frame is
-    /// held on the lane above for the transition's length instead.
+    /// An incoming clip with less footage before its in-point than half
+    /// the transition takes what it has - winding the start back further
+    /// without the clock played everything after the cut early and ran the
+    /// end off the file into black (#236) - and the rest of the overlap
+    /// goes after the cut, where the outgoing clip runs on.
     #[test]
-    fn a_clip_without_the_handle_stays_put_and_its_first_frame_is_held() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 0.25),
-        ];
+    fn a_short_handle_leans_the_overlap_after_the_cut() {
+        let mut clips = cut_with_handles();
+        clips[1].source_start = 0.25;
         clips[1].fade_in = 0.25;
         clips[1].transition = spec("cross-fade", 2.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
 
         let b = &clips[1];
-        assert_eq!((b.start, b.duration, b.source_start), (4.0, 4.0, 0.25));
-        assert_eq!(b.video_fade_in, 0.0, "the clip itself does not ramp");
-        assert_eq!(b.track, 0, "on its own lane, after the outgoing clip");
-        assert_eq!(b.fade_in, 0.25, "its own sound fade, not the dissolve's");
-
-        assert_eq!(clips.len(), 3, "the hold is a clip of its own");
-        let hold = &clips[2];
-        assert!(hold.hold);
-        assert_eq!((hold.start, hold.duration), (2.0, 2.0));
-        assert_eq!(hold.source_start, 0.25, "the frame the clip starts on");
-        assert_eq!(hold.track, 1, "directly above the outgoing clip");
-        assert_eq!(hold.video_fade_in, 2.0, "the dissolve rides the hold");
-        assert!(hold.muted);
-        assert_eq!(hold.has_audio, Some(false));
+        assert_eq!((b.start, b.duration, b.source_start), (3.75, 4.25, 0.0));
+        assert_eq!(b.video_fade_in, 2.0);
+        assert_eq!(b.track, 1);
+        assert_eq!(b.fade_in, 2.0, "the dissolve's sound fade");
+        assert_eq!(clips[0].duration, 5.75, "runs on for the other 1.75 s");
+        assert_eq!(clips.len(), 2, "nothing is held");
     }
 
     #[test]
-    fn a_cross_fade_on_untrimmed_clip_holds_the_first_frame() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 0.0),
-        ];
+    fn an_untrimmed_incoming_clip_starts_the_overlap_at_the_cut() {
+        let mut clips = cut_with_handles();
+        clips[1].source_start = 0.0;
         clips[1].transition = spec("cross-fade", 1.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
 
         let b = &clips[1];
         assert_eq!((b.start, b.duration, b.source_start), (4.0, 4.0, 0.0));
-        assert_eq!(b.video_fade_in, 0.0);
-        let hold = &clips[2];
-        assert_eq!(
-            (hold.start, hold.duration, hold.source_start),
-            (3.0, 1.0, 0.0)
-        );
-        assert_eq!(hold.video_fade_in, 1.0);
+        assert_eq!(b.track, 1, "above the outgoing clip running on");
+        assert_eq!(b.video_fade_in, 1.0);
+        assert_eq!(clips[0].duration, 5.0);
     }
 
+    /// An outgoing clip with no footage past its out-point - the file ends
+    /// there, or its length is not known - ends at the cut, and its last
+    /// frame is held beneath the incoming one for the rest of the overlap.
     #[test]
-    fn a_packaged_transition_on_untrimmed_clip_spans_the_hold() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 0.0),
-        ];
+    fn an_outgoing_clip_without_footage_past_its_end_is_held() {
+        let mut clips = cut_with_handles();
+        clips[0].media_duration = Some(4.0);
         clips[1].transition = spec("concat.dissolve", 1.0);
         let spans = resolve_transitions(&mut clips, FrameRate::THIRTY);
 
-        let b = &clips[1];
-        assert_eq!((b.start, b.duration, b.source_start), (4.0, 4.0, 0.0));
+        let a = &clips[0];
+        assert_eq!((a.start, a.duration), (0.0, 4.0), "ends at the cut");
+        assert_eq!(clips.len(), 3, "the hold is a clip of its own");
         let hold = &clips[2];
         assert!(hold.hold);
-        assert_eq!((hold.start, hold.duration), (3.0, 1.0));
-        assert_eq!(hold.video_fade_in, 1.0);
+        assert_eq!((hold.start, hold.duration), (4.0, 0.5));
+        assert_eq!(
+            hold.source_start,
+            4.0 - 1.0 / 30.0,
+            "the frame the clip ends on"
+        );
+        assert_eq!(hold.track, 0, "on the outgoing clip's lane");
+        assert!(hold.muted);
+        assert_eq!(hold.has_audio, Some(false));
+
+        let b = &clips[1];
+        assert_eq!((b.start, b.track), (3.5, 1));
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].start, Rational::from_int(3));
-        assert_eq!(spans[0].end, Rational::from_int(4));
-        assert_eq!(spans[0].to_track, 1, "the hold's lane");
+        assert_eq!(spans[0].start, Rational::new(7, 2));
+        assert_eq!(spans[0].end, Rational::new(9, 2));
+        assert_eq!(spans[0].to_track, 1);
     }
 
-    /// A push into a clip with no handle slides the hold in, and the clip
-    /// then starts where the hold leaves it; a keyed placement on the clip
-    /// is held at its head, not played again over the pre-roll.
+    /// A push cannot slide a held frame - the hold carries no keys - so
+    /// over an outgoing clip without footage past its end it dissolves;
+    /// a keyed placement on the clip is held where its ride leaves it.
     #[test]
-    fn a_push_without_the_handle_rides_the_hold() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 0.0),
-        ];
-        clips[1].animation.push(ExportKey {
-            property: "scale".to_owned(),
-            at: 0.0,
-            value: 2.0,
-            ease: linear_ease(),
-        });
-        clips[1].animation.push(ExportKey {
-            property: "scale".to_owned(),
-            at: 1.0,
-            value: 1.0,
-            ease: linear_ease(),
-        });
+    fn a_push_over_a_held_outgoing_frame_becomes_a_dissolve() {
+        let mut clips = cut_with_handles();
+        clips[0].media_duration = None;
+        for (at, value) in [(0.0, 1.0), (1.0, 2.0)] {
+            clips[0].animation.push(ExportKey {
+                property: "scale".to_owned(),
+                at,
+                value,
+                ease: linear_ease(),
+            });
+        }
         clips[1].transition = spec("push", 1.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
 
         let hold = &clips[2];
-        assert_eq!(keys_on(hold, "offsetX"), vec![(0.0, 1.0), (1.0, 0.0)]);
-        assert!(
-            keys_on(hold, "scale").is_empty(),
-            "the ride stays on the clip"
-        );
-        assert_eq!(hold.scale, 2.0, "held where the ride starts");
+        assert!(hold.animation.is_empty(), "the ride stays on the clip");
+        assert_eq!(hold.scale, 2.0, "held where the ride ends");
+        assert_eq!(clips[1].video_fade_in, 1.0, "falls back to the dissolve");
+        assert!(keys_on(&clips[1], "offsetX").is_empty());
+        assert!(keys_on(&clips[0], "offsetX").is_empty());
         assert_eq!(
-            keys_on(&clips[0], "offsetX"),
-            vec![(0.75, 0.0), (1.0, -1.0)]
-        );
-        assert_eq!(
-            keys_on(&clips[1], "scale").len(),
+            keys_on(&clips[0], "scale").len(),
             2,
             "the user's keys are untouched"
         );
-        assert!(keys_on(&clips[1], "offsetX").is_empty());
     }
 
     #[test]
@@ -2990,27 +3531,25 @@ mod tests {
 
     #[test]
     fn a_push_slides_both_pictures_across_the_overlap() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 2.0),
-        ];
+        let mut clips = cut_with_handles();
         clips[1].transition = spec("push", 1.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
 
-        // The overlap is the dissolve's: a second of pre-roll on the lane
-        // above, sound fading in with it - but no picture fade.
+        // The overlap is the dissolve's: half a second either side of the
+        // cut, the incoming clip on the lane above, sound fading in with
+        // it - but no picture fade.
         let b = &clips[1];
-        assert_eq!((b.start, b.duration, b.source_start), (3.0, 5.0, 1.0));
+        assert_eq!((b.start, b.duration, b.source_start), (3.5, 4.5, 1.5));
         assert_eq!(b.track, 1);
         assert_eq!(b.fade_in, 1.0);
         assert_eq!(b.video_fade_in, 0.0, "a push does not dissolve");
         // The incoming picture comes in from a frame's width to the right
-        // over its first second (a fifth of its new length).
-        assert_eq!(keys_on(b, "offsetX"), vec![(0.0, 1.0), (0.2, 0.0)]);
+        // over its first second.
+        assert_eq!(keys_on(b, "offsetX"), vec![(0.0, 1.0), (1.0 / 4.5, 0.0)]);
         // The outgoing one leaves to the left over its last second.
         assert_eq!(
             keys_on(&clips[0], "offsetX"),
-            vec![(0.75, 0.0), (1.0, -1.0)]
+            vec![(1.0 - 1.0 / 4.5, 0.0), (1.0, -1.0)]
         );
         // Both ride the same ease, which is what keeps them edge to edge.
         assert_eq!(clips[0].animation[1].ease, clips[1].animation[1].ease);
@@ -3019,10 +3558,7 @@ mod tests {
 
     #[test]
     fn a_push_over_a_clip_the_user_keyed_becomes_a_dissolve() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 2.0),
-        ];
+        let mut clips = cut_with_handles();
         clips[0].animation.push(ExportKey {
             property: "offsetX".to_owned(),
             at: 0.5,
@@ -3045,15 +3581,18 @@ mod tests {
 
     #[test]
     fn a_zoom_scales_both_under_a_dissolve() {
-        let mut clips = vec![
-            clip("video", 0, 0.0, 4.0, 0.0),
-            clip("video", 0, 4.0, 4.0, 2.0),
-        ];
+        let mut clips = cut_with_handles();
         clips[1].transition = spec("zoom", 1.0);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
         assert_eq!(clips[1].video_fade_in, 1.0);
-        assert_eq!(keys_on(&clips[1], "scale"), vec![(0.0, 1.25), (0.2, 1.0)]);
-        assert_eq!(keys_on(&clips[0], "scale"), vec![(0.75, 1.0), (1.0, 1.4)]);
+        assert_eq!(
+            keys_on(&clips[1], "scale"),
+            vec![(0.0, 1.25), (1.0 / 4.5, 1.0)]
+        );
+        assert_eq!(
+            keys_on(&clips[0], "scale"),
+            vec![(1.0 - 1.0 / 4.5, 1.0), (1.0, 1.4)]
+        );
     }
 
     #[test]
@@ -3065,7 +3604,7 @@ mod tests {
         clips[1].transition = spec("wipe-right", 0.5);
         resolve_transitions(&mut clips, FrameRate::THIRTY);
         let b = &clips[1];
-        assert_eq!((b.start, b.duration), (3.5, 4.5));
+        assert_eq!((b.start, b.duration), (3.75, 4.25));
         assert_eq!(b.video_fade_in, 0.0, "the edge does the revealing");
         assert_eq!(
             b.transition_shapes,

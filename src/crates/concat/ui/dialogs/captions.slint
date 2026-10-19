@@ -11,7 +11,7 @@ import { Switch } from "../inspector/controls.slint";
 
 // Captions: what the tray's Captions tool opens.
 //
-// Two sheets in one, and a switch between them: "Use voice from timeline".
+// Two sheets in one, and a switch between them: "Use Sample Voice".
 // On, the words are a clip's: one picked from the timeline's clips that
 // have sound, through the transcriber, cut to the words' own timing. Off,
 // they are a script typed here, one title per sentence at reading pace,
@@ -19,15 +19,21 @@ import { Switch } from "../inspector/controls.slint";
 // silent video cannot be sent to the transcriber. The switch starts on
 // when the sheet is opened on a clip with sound - from the clip's menu, or
 // with one selected - and off otherwise. Then where the lines sit and how
-// big they are, and one button. While it runs the sheet is the progress
-// report: a transcription knows how far through the sound it is, so it
-// gets a real bar and not a sweep. The language is the transcriber's to
-// work out unless one is picked; an English-only model is only ever told
-// English.
+// big they are, and one button. While it runs
+// the sheet is the progress report: a transcription knows how far through
+// the sound it is, so it gets a real bar and not a sweep. The language is
+// the transcriber's to work out unless one is picked; an English-only model
+// is only ever told English.
+//
+// On a desk it is a card floating over the editor (see Modal.floating): the
+// timeline stays live under it, so the clip it transcribes follows the
+// selection - a clip with sound selected is the one shown and run. Closed,
+// a transcription goes on, and opened again the card shows it. On a phone
+// it is a sheet.
 
 export struct CaptionsSheetData {
     open: bool,
-    /// "Use voice from timeline": the words come from a clip's sound.
+    /// "Use Sample Voice": the words come from a clip's sound.
     from-voice: bool,
     /// The timeline's clips with sound, by file and start.
     sources: [string],
@@ -78,6 +84,8 @@ export component CaptionsDialog inherits Modal {
     callback size-changed(index: int);
     callback begin();
     callback cancel();
+    callback import-srt();
+    callback export-srt();
 
     property <bool> from-voice: root.data.from-voice;
 
@@ -103,8 +111,61 @@ export component CaptionsDialog inherits Modal {
     init => { root.draft = root.data.text; }
 
     VerticalLayout {
-        // The switch, above both halves. A row of its own rather than a
-        // DialogRow, whose label column is too narrow for the words.
+        if !root.data.running && !root.from-voice: DialogSection {
+            first: true;
+            title: I18n.t("common.script");
+
+            Rectangle {
+                height: 104px;
+                border-radius: Theme.r;
+                background: Theme.well;
+                border-width: 1px;
+                border-color: script.has-focus ? Theme.accent : Theme.line;
+                clip: true;
+
+                script := TextInput {
+                    x: 10px;
+                    y: 8px;
+                    width: parent.width - 20px;
+                    height: parent.height - 16px;
+                    text <=> root.draft;
+                    color: Theme.fg;
+                    font-size: Theme.fs-lg;
+                    single-line: false;
+                    wrap: word-wrap;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.on-accent;
+                    changed has-focus => { root.typing = self.has-focus; }
+                    edited => { root.text-edited(self.text); }
+                    // Home and End are unbound in Slint on macOS and would
+                    // walk up to the window's playhead shortcuts.
+                    key-pressed(event) => {
+                        if (event.text == Key.Home) {
+                            self.set-selection-offsets(0, 0);
+                            return accept;
+                        }
+                        if (event.text == Key.End) {
+                            self.set-selection-offsets(1000000000, 1000000000);
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                if root.draft == "" && !script.has-focus: Text {
+                    x: 10px;
+                    y: 8px;
+                    text: I18n.t("captions.typeWordsPutScreen");
+                    color: Theme.fg-dim;
+                    font-size: Theme.fs-lg;
+                }
+            }
+        }
+
+        // The switch, under the script it stands in for: off, the words
+        // are typed above it; on, they come from a clip's voice, chosen
+        // under it. A row of its own rather than a DialogRow, whose label
+        // column is too narrow for the words.
         if !root.data.running: HorizontalLayout {
             padding-left: 14px;
             padding-right: 14px;
@@ -113,7 +174,7 @@ export component CaptionsDialog inherits Modal {
 
             Text {
                 horizontal-stretch: 1;
-                text: I18n.t("captions.useVoiceFromTimeline");
+                text: I18n.t("captions.transcribeClipVoice");
                 color: Theme.fg;
                 font-size: Theme.fs;
                 vertical-alignment: center;
@@ -181,57 +242,6 @@ export component CaptionsDialog inherits Modal {
                 color: Theme.fg-muted;
                 font-size: Theme.fs-sm;
                 wrap: word-wrap;
-            }
-        }
-
-        if !root.data.running && !root.from-voice: DialogSection {
-            first: true;
-            title: I18n.t("common.script");
-
-            Rectangle {
-                height: 104px;
-                border-radius: Theme.r;
-                background: Theme.well;
-                border-width: 1px;
-                border-color: script.has-focus ? Theme.accent : Theme.line;
-                clip: true;
-
-                script := TextInput {
-                    x: 10px;
-                    y: 8px;
-                    width: parent.width - 20px;
-                    height: parent.height - 16px;
-                    text <=> root.draft;
-                    color: Theme.fg;
-                    font-size: Theme.fs-lg;
-                    single-line: false;
-                    wrap: word-wrap;
-                    selection-background-color: Theme.accent;
-                    selection-foreground-color: Theme.on-accent;
-                    changed has-focus => { root.typing = self.has-focus; }
-                    edited => { root.text-edited(self.text); }
-                    // Home and End are unbound in Slint on macOS and would
-                    // walk up to the window's playhead shortcuts.
-                    key-pressed(event) => {
-                        if (event.text == Key.Home) {
-                            self.set-selection-offsets(0, 0);
-                            return accept;
-                        }
-                        if (event.text == Key.End) {
-                            self.set-selection-offsets(1000000000, 1000000000);
-                            return accept;
-                        }
-                        return reject;
-                    }
-                }
-
-                if root.draft == "" && !script.has-focus: Text {
-                    x: 10px;
-                    y: 8px;
-                    text: I18n.t("captions.typeWordsPutScreen");
-                    color: Theme.fg-dim;
-                    font-size: Theme.fs-lg;
-                }
             }
         }
 
@@ -363,6 +373,32 @@ export component CaptionsDialog inherits Modal {
                 label: root.from-voice ? I18n.t("captions.generateCaptions") : I18n.t("captions.addCaptions");
                 enabled: root.from-voice ? root.data.ready && root.data.source >= 0 : root.draft != "";
                 clicked => { root.begin(); }
+            }
+
+            // Captions as a SubRip file: one read in as titles with the
+            // look above, timed as the file says; or a lane of titles
+            // written out: the selected title's lane, or with none
+            // selected the lane with the most titles, the captions'.
+            if !root.data.running: HorizontalLayout {
+                spacing: 8px;
+
+                Button {
+                    horizontal-stretch: 1;
+                    block: true;
+                    ghost: true;
+                    glyph: Glyph.import;
+                    label: I18n.t("captions.importSrt");
+                    clicked => { root.import-srt(); }
+                }
+
+                Button {
+                    horizontal-stretch: 1;
+                    block: true;
+                    ghost: true;
+                    glyph: Glyph.export;
+                    label: I18n.t("captions.exportSrt");
+                    clicked => { root.export-srt(); }
+                }
             }
         }
     }
