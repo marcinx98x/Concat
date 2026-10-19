@@ -988,6 +988,9 @@ pub struct Studio {
     /// about a track that the document does not.
     pub lanes: crate::panes::timeline::TimelinePane,
     pub selection: Vec<String>,
+    /// Tracks highlighted by an empty-lane click (Shift toggles). Distinct
+    /// from clip `selection`.
+    pub selected_tracks: HashSet<String>,
     pub playhead: f32,
     pub playing: bool,
     transport: slint::Timer,
@@ -2451,6 +2454,7 @@ impl Studio {
             waves: RefCell::new(HashMap::new()),
             lanes: crate::panes::timeline::TimelinePane::default(),
             selection: Vec::new(),
+            selected_tracks: HashSet::new(),
             playhead: 0.0,
             // ~20px a second: a ten-second cut fits a pane at its default width.
             playing: false,
@@ -5209,6 +5213,26 @@ impl Studio {
 
     // ── gestures ──
 
+    /// Empty-lane click: highlight that track. Shift toggles within the set.
+    /// Clears clip selection; the playhead is left alone (ruler seeks).
+    pub fn lane_selected(&mut self, y: f32, additive: bool) {
+        self.flush_commit();
+        let row = self.row_at(y);
+        let Some(track_id) = self.row_track(row).map(|track| track.id.clone()) else {
+            return;
+        };
+        if additive {
+            if !self.selected_tracks.remove(&track_id) {
+                self.selected_tracks.insert(track_id);
+            }
+        } else {
+            self.selected_tracks.clear();
+            self.selected_tracks.insert(track_id);
+        }
+        self.selection.clear();
+        self.transition_selected = None;
+    }
+
     /// A press resolves the selection before anything moves, so a drag that
     /// starts on an already-selected clip carries the whole set.
     pub fn clip_pressed(&mut self, id: &str, additive: bool, edge: i32) {
@@ -5222,6 +5246,7 @@ impl Studio {
         // now lands before the selection moves: a commit flushed after the
         // change would look for it on the newly selected clip and lose it.
         self.flush_commit();
+        self.selected_tracks.clear();
         // A press on a transition's seam or handles selects the transition,
         // not the clip it rides into; a drag there still sets its length.
         if edge == 2
@@ -8856,6 +8881,7 @@ impl Studio {
                 self.project_name = info.name.clone();
                 self.export.name = projects::folder_name(&info.name);
                 self.selection.clear();
+                self.selected_tracks.clear();
                 self.transition_selected = None;
                 self.media.selected.clear();
                 self.playhead = 0.0;
@@ -8867,6 +8893,9 @@ impl Studio {
                 // A phone's window is already the screen, and `centred` is
                 // how this side of the window knows which it is.
                 if !self.lanes.centred {
+                    // Hold auto-fit across maximize: the first lanes width is
+                    // still the pre-maximize desk; end_fit_hold runs after.
+                    self.lanes.fit_hold = true;
                     self.present_maximized.set(true);
                 }
                 self.handle(crate::panes::Msg::Monitor(
@@ -9483,13 +9512,36 @@ impl Studio {
             // writes the preferred 1400×900 back over a maximize done now.
             // The next turn is after that pass.
             slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
-                if let Some(app) = weak.upgrade() {
-                    // Slint's own flag, not winit directly: the layout pass
-                    // is what applies it, after the size check, so a preferred
-                    // size cannot put the window back.
-                    app.window().set_maximized(true);
-                    app.set_window_maximized(true);
-                }
+                let Some(app) = weak.upgrade() else {
+                    return;
+                };
+                // Slint's own flag, not winit directly: the layout pass
+                // is what applies it, after the size check, so a preferred
+                // size cannot put the window back.
+                app.window().set_maximized(true);
+                app.set_window_maximized(true);
+                // Two more turns: maximize layout, then lanes-resized, then
+                // final auto-fit at the full desk width (tray "Zoom to fit").
+                // `fit_hold` keeps refitting on every Resized until then.
+                let weak = app.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                    let weak = weak.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                        if weak.upgrade().is_none() {
+                            return;
+                        }
+                        crate::host::Shell::with(|shell, app| {
+                            {
+                                let mut studio = shell.studio.borrow_mut();
+                                let duration = studio.duration();
+                                let playhead = studio.playhead;
+                                studio.lanes.end_fit_hold(duration);
+                                studio.lanes.recentre(playhead);
+                            }
+                            shell.studio.borrow().publish_lanes(&app, &shell.models);
+                        });
+                    });
+                });
             });
         } else if restore_screen {
             let weak = app.as_weak();
@@ -9641,6 +9693,7 @@ impl Studio {
                         size: self.lane_size(&lane.id),
                         height,
                         top,
+                        selected: self.selected_tracks.contains(&lane.id),
                     };
                     top += height;
                     row

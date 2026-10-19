@@ -1118,7 +1118,8 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
             // usually an empty one that clears the selection.
             state.flush_commit();
             // A band wholly on the ground over or under the lanes catches
-            // nothing: a press there moves the playhead and clears.
+            // nothing: a press there clears. Clip marquee clears track
+            // highlights; empty-lane clicks use lane-selected instead.
             let rows = state.band_rows(from_y, to_y);
             let caught: Vec<String> = state
                 .timeline()
@@ -1133,6 +1134,9 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
                 })
                 .map(|clip| clip.id.clone())
                 .collect();
+            if !additive {
+                state.selected_tracks.clear();
+            }
             if additive {
                 for id in caught {
                     if !state.selection.contains(&id) {
@@ -1145,6 +1149,9 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
             }
         }
     ));
+    editor.on_lane_selected(on_lanes!(|state, y: f32, additive: bool| {
+        state.lane_selected(y, additive);
+    }));
 
     // ── the inspector ──
     // The keyframe cluster. Its own global, so a row deep in a panel does

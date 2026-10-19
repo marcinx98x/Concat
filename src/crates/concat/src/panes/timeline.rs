@@ -105,6 +105,10 @@ pub struct TimelinePane {
     /// A project just opened and the lanes have not yet shown the whole
     /// cut. Cleared by the first fit, so a later resize keeps the zoom.
     fit_pending: bool,
+    /// Keep re-fitting on every Resized until [`Self::end_fit_hold`]: set
+    /// when the desk will maximize after open, so the first (pre-maximize)
+    /// width is not the final auto-fit.
+    pub fit_hold: bool,
     /// Bumped when a project opens, so the lane stack scrolls back to the
     /// top. The pane draws that scroll; Rust only says that it should.
     pub stack_home: i32,
@@ -129,6 +133,7 @@ impl Default for TimelinePane {
             lane_view: HashMap::new(),
             width: 0.0,
             fit_pending: false,
+            fit_hold: false,
             stack_home: 0,
             centred: false,
         }
@@ -222,17 +227,23 @@ impl TimelinePane {
     /// A project opened. The view returns to the start of the cut and, once
     /// the lanes have a width, shows the whole of it. A later resize does
     /// not fit again: that zoom is the one the tray's buttons then change.
-    fn opened(&mut self, duration: f32) {
+    ///
+    /// Width is cleared so a leftover size from a previous project cannot
+    /// fit early and clear `fit_pending` before the new desk reports its
+    /// real lane width (Reset runs before `on_start` flips). `fit_hold` is
+    /// left alone: the opener sets it when a maximize will follow.
+    fn opened(&mut self, _duration: f32) {
         self.scroll_left = 0.0;
+        self.width = 0.0;
         self.fit_pending = true;
         self.stack_home = self.stack_home.wrapping_add(1);
-        self.fit_now(duration);
     }
 
     /// The lanes are `width` pixels wide. The first time after [`opened`]
     /// that the width is real, the cut is fitted; after that only the
-    /// width is kept.
-    fn resized_to(&mut self, width: f32, duration: f32) {
+    /// width is kept — unless [`Self::fit_hold`], which refits every resize
+    /// until [`Self::end_fit_hold`].
+    pub fn resized_to(&mut self, width: f32, duration: f32) {
         self.width = width.max(0.0);
         self.fit_now(duration);
     }
@@ -241,8 +252,18 @@ impl TimelinePane {
     fn fit_now(&mut self, duration: f32) {
         if self.fit_pending && self.width > 1.0 {
             self.fit(duration, self.width);
-            self.fit_pending = false;
+            if !self.fit_hold {
+                self.fit_pending = false;
+            }
         }
+    }
+
+    /// Maximize (or the phone's first layout) has settled: one last fit at
+    /// the current width, then stop auto-fitting on resize.
+    pub fn end_fit_hold(&mut self, duration: f32) {
+        self.fit_hold = false;
+        self.fit_pending = true;
+        self.fit_now(duration);
     }
 
     /// The lanes scrolled to `seconds` at their left edge. See `Scrolled`.
@@ -488,6 +509,11 @@ mod tests {
         let mut view = pane(1000.0, 40.0, 0.05);
         let duration = 7200.0;
         view.opened(duration);
+        // Stale width must not fit early — wait for the new desk's report.
+        assert_eq!(view.width, 0.0);
+        assert!(view.fit_pending);
+        assert!((view.seconds_per_pixel - 0.05).abs() < 1e-6);
+        view.resized_to(1000.0, duration);
         assert!(
             view.width * view.seconds_per_pixel >= duration,
             "{}",
@@ -512,6 +538,36 @@ mod tests {
         let zoom = view.seconds_per_pixel;
         view.resized_to(700.0, 120.0);
         assert_eq!(view.seconds_per_pixel, zoom);
+    }
+
+    #[test]
+    fn a_fit_hold_refits_until_released_after_maximize() {
+        let mut view = pane(0.0, 0.0, 0.05);
+        let duration = 120.0;
+        view.opened(duration);
+        view.fit_hold = true;
+        view.resized_to(400.0, duration);
+        assert!(view.fit_pending, "hold keeps pending");
+        let small = view.seconds_per_pixel;
+        view.resized_to(800.0, duration);
+        assert!(view.fit_pending);
+        assert!(
+            (view.seconds_per_pixel - small).abs() > 1e-6,
+            "refit on the larger desk"
+        );
+        let fitted = {
+            let mut expected = pane(800.0, 0.0, 0.05);
+            expected.fit(duration, 800.0);
+            expected.seconds_per_pixel
+        };
+        assert!((view.seconds_per_pixel - fitted).abs() < 1e-6);
+        view.end_fit_hold(duration);
+        assert!(!view.fit_hold);
+        assert!(!view.fit_pending);
+        let zoom = view.seconds_per_pixel;
+        view.resized_to(600.0, duration);
+        assert_eq!(view.seconds_per_pixel, zoom, "later resize keeps zoom");
+        assert_eq!(view.width, 600.0);
     }
 
     #[test]
