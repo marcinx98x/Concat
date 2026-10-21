@@ -132,6 +132,22 @@ pub(crate) fn fail(operation: &'static str, path: &Path, error: ffmpeg::Error) -
     }
 }
 
+/// The `channel_layout=` value for an `abuffer` source.
+///
+/// A human description like `5.1(side)` carries parentheses that the filter
+/// option parser treats specially, so the buffer ends up with a different
+/// layout than the frame and `buffersrc.add` returns EINVAL. A native mask
+/// as hex round-trips; an unspecified or custom layout falls back to the
+/// unordered channel count (`NC`).
+pub(crate) fn abuffer_channel_layout(
+    layout: &ffmpeg::util::channel_layout::ChannelLayout<'_>,
+) -> String {
+    match layout.mask() {
+        Some(mask) => format!("0x{:x}", mask.bits()),
+        None => format!("{}C", layout.channels()),
+    }
+}
+
 /// `AVERROR(EAGAIN)`: the codec or filter wants more input before it can
 /// produce output.
 pub(crate) fn is_again(error: &ffmpeg::Error) -> bool {
