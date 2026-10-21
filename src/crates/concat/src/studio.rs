@@ -899,6 +899,10 @@ pub struct Studio {
 
     // ── the launch screen ──
     pub on_start: bool,
+    /// Set when a project closes back to the launch screen, taken by the
+    /// next `publish`: the editor had filled the work area, and the start
+    /// sheet must not stay maximised. A phone never sets it.
+    present_restored: std::cell::Cell<bool>,
     pub start: crate::panes::start::StartPane,
     pub recents: Vec<projects::Recent>,
     pub posters: HashMap<String, slint::Image>,
@@ -2357,6 +2361,7 @@ impl Studio {
             activity_burst: None,
             toast: ToastState::default(),
             on_start: true,
+            present_restored: std::cell::Cell::new(false),
             start,
             recents,
             posters: HashMap::new(),
@@ -8635,6 +8640,11 @@ impl Studio {
             .playback
             .set_clips(std::path::PathBuf::new(), Vec::new());
         self.on_start = true;
+        // The desk leaves the work area: the launch screen is a card-sized
+        // window again, not the editor that had filled the screen.
+        if !self.lanes.centred {
+            self.present_restored.set(true);
+        }
         self.recents = projects::recents(&self.host.dirs.config);
     }
 
@@ -9008,6 +9018,7 @@ impl Studio {
     // ── publishing ──
 
     pub fn publish(&self, app: &App, models: &Models) {
+        let restore_screen = self.present_restored.replace(false);
         // The tray's three menu labels and the tooltips' bare-letter
         // hints, spelled from the keymap so a rebind moves the words
         // with the key. An action left unbound shows an em dash rather
@@ -9033,6 +9044,21 @@ impl Studio {
         self.publish_lanes(app, models);
         self.publish_chrome(app, models);
         self.publish_dock(app, models);
+        if restore_screen {
+            let weak = app.as_weak();
+            // This publish dirties the window, and the pass that follows
+            // writes the preferred 1400×900 back over a restore done now.
+            // The next turn is after that pass.
+            slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                if let Some(app) = weak.upgrade() {
+                    // Slint's own flag, not winit directly: the layout pass
+                    // is what applies it, after the size check, so a preferred
+                    // size cannot put the window back.
+                    app.window().set_maximized(false);
+                    app.set_window_maximized(false);
+                }
+            });
+        }
     }
 
     pub fn publish_dock(&self, _app: &App, models: &Models) {

@@ -132,6 +132,22 @@ pub(crate) fn fail(operation: &'static str, path: &Path, error: ffmpeg::Error) -
     }
 }
 
+/// The `channel_layout=` value for an `abuffer` source.
+///
+/// A human description like `5.1(side)` carries parentheses that the filter
+/// option parser treats specially, so the buffer ends up with a different
+/// layout than the frame and `buffersrc.add` returns EINVAL. A native mask
+/// as hex round-trips; an unspecified or custom layout falls back to the
+/// unordered channel count (`NC`).
+pub(crate) fn abuffer_channel_layout(
+    layout: &ffmpeg::util::channel_layout::ChannelLayout<'_>,
+) -> String {
+    match layout.mask() {
+        Some(mask) => format!("0x{:x}", mask.bits()),
+        None => format!("{}C", layout.channels()),
+    }
+}
+
 /// `AVERROR(EAGAIN)`: the codec or filter wants more input before it can
 /// produce output.
 pub(crate) fn is_again(error: &ffmpeg::Error) -> bool {
@@ -270,5 +286,33 @@ mod tests {
         assert_eq!(seconds(1001, tb), Some(Rational::new(1001, 30000)));
         assert_eq!(seconds(5, ffmpeg::Rational::new(1, 0)), None);
         assert_eq!(av_ticks(Rational::new(3, 2)), 1_500_000);
+    }
+
+    #[test]
+    fn abuffer_layout_prefers_a_hex_mask_over_a_named_description() {
+        use ffmpeg::util::channel_layout::{ChannelLayout, ChannelLayoutMask};
+
+        let stereo = ChannelLayout::from_mask(ChannelLayoutMask::STEREO).expect("stereo");
+        let stereo_arg = abuffer_channel_layout(&stereo);
+        assert!(
+            stereo_arg.starts_with("0x"),
+            "stereo should be a hex mask, got {stereo_arg}"
+        );
+        // 5.1 is the layout DDP often names `5.1(side)` — parentheses that
+        // break the filter option parser when passed as a description.
+        let surround =
+            ChannelLayout::from_mask(ChannelLayoutMask::_5POINT1).expect("5.1");
+        let surround_arg = abuffer_channel_layout(&surround);
+        assert!(
+            surround_arg.starts_with("0x"),
+            "5.1 should be a hex mask, got {surround_arg}"
+        );
+        assert!(
+            !surround_arg.contains('('),
+            "hex mask must not carry parentheses: {surround_arg}"
+        );
+
+        let unspec = ChannelLayout::unspecified(6);
+        assert_eq!(abuffer_channel_layout(&unspec), "6C");
     }
 }

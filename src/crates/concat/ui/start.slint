@@ -850,6 +850,12 @@ component DropTile inherits Rectangle {
 component PosterAction inherits Rectangle {
     in property <Glyph> glyph;
     in property <string> label;
+    /// The tip waits until the button is actually drawn: at opacity 0 it
+    /// still takes the pointer, and a tip there would flash over empty air.
+    in property <bool> tip-ok: true;
+    /// So the card can keep the row up while the pointer is on a button
+    /// and not on the Pressable underneath.
+    out property <bool> hovering: touch.has-hover;
 
     callback clicked();
 
@@ -879,7 +885,7 @@ component PosterAction inherits Rectangle {
 
     Tip {
         text: root.label;
-        active: touch.has-hover;
+        active: touch.has-hover && root.tip-ok;
     }
 }
 
@@ -888,6 +894,11 @@ component PosterAction inherits Rectangle {
 // under it. Show in folder and Remove come up over the poster on hover - or
 // stay there, where there is no hover. A project whose folder has gone
 // keeps its card, greyed, saying so, with Remove always up.
+//
+// The action buttons stay in the tree: hiding them with `if` when the
+// card's Pressable lost hover (because a button took it) made them
+// flicker and refuse the click. Opacity does the reveal; `on-action`
+// keeps them drawn while the pointer is on a button.
 component PosterCard inherits Pressable {
     in property <RecentProjectData> project;
     /// No pointer to hover with, so the actions stay out.
@@ -900,14 +911,17 @@ component PosterCard inherits Pressable {
     callback revealed();
 
     property <length> inset: 6px;
-    property <bool> actions: root.touchy || root.lit || root.ring || root.project.missing;
+    property <bool> show-reveal: root.can-reveal && !root.project.missing;
+    property <bool> on-action: reveal.hovering || forget.hovering;
+    property <bool> emphasize: root.touchy || root.lit || root.ring
+        || root.project.missing || root.on-action;
 
     label: root.project.name;
     clicked => { root.opened(); }
     deleted => { root.forgotten(); }
-    background: root.lit ? Theme.launch-raised : Theme.launch-panel;
+    background: root.lit || root.on-action ? Theme.launch-raised : Theme.launch-panel;
     border-width: 1px;
-    border-color: root.lit ? Theme.line-strong : Theme.line;
+    border-color: root.lit || root.on-action ? Theme.line-strong : Theme.line;
 
     animate background, border-color { duration: 120ms; easing: cubic-bezier(0.4, 0, 0.2, 1); }
 
@@ -980,22 +994,30 @@ component PosterCard inherits Pressable {
             }
         }
 
-        if root.actions: HorizontalLayout {
+        HorizontalLayout {
             x: parent.width - self.preferred-width - 8px;
             y: 8px;
             height: 28px;
             width: self.preferred-width;
-            spacing: 6px;
+            spacing: root.show-reveal ? 6px : 0px;
+            opacity: root.emphasize ? 1.0 : 0.0;
 
-            if root.can-reveal && !root.project.missing: PosterAction {
+            // Always mounted so the card can read `hovering` without an
+            // `if` that tears the id out of scope; collapsed when unused.
+            reveal := PosterAction {
+                width: root.show-reveal ? 28px : 0px;
+                height: root.show-reveal ? 28px : 0px;
+                opacity: root.show-reveal ? 1.0 : 0.0;
                 glyph: Glyph.folder;
                 label: I18n.t("start.showInFolder");
+                tip-ok: root.emphasize && root.show-reveal;
                 clicked => { root.revealed(); }
             }
 
-            PosterAction {
+            forget := PosterAction {
                 glyph: Glyph.close;
                 label: I18n.t("start.removeFromList");
+                tip-ok: root.emphasize;
                 clicked => { root.forgotten(); }
             }
         }

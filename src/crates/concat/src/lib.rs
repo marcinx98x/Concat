@@ -177,11 +177,13 @@ pub fn smoke() -> Result<(), slint::PlatformError> {
 /// hiding the window, quitting the loop, starting a replacement build - runs
 /// only when that write landed.
 ///
-/// Every path out goes through this: the title bar's X, the system's close
-/// request, File › Close Window and a version switch. Before it existed, a
-/// save that failed still hid the window and quit, taking whatever the
-/// project held with it; a failure here leaves the session, its running jobs
-/// and the window exactly as they were, and returns the reason.
+/// File › Exit / Quit, Ctrl+Q and a version switch go through this. The
+/// title bar's × and a system close request use [`close_project_or_quit`]
+/// instead: from the editor they only close the project. Before this
+/// helper existed, a save that failed still hid the window and quit, taking
+/// whatever the project held with it; a failure here leaves the session,
+/// its running jobs and the window exactly as they were, and returns the
+/// reason.
 pub(crate) fn close_window(
     close: impl FnOnce() -> Result<(), String>,
     leave: impl FnOnce(),
@@ -191,6 +193,29 @@ pub(crate) fn close_window(
         leave();
     }
     result
+}
+
+/// The title bar's × and a system close (Alt+F4, taskbar): from the editor,
+/// the same as File › Close project — back to the launch screen, app still
+/// running; from the launch screen, leave the app. Returns whether the
+/// window should stay shown (`true` after closing a project or a refused
+/// save).
+fn close_project_or_quit(shell: &Shell, app: &App) -> bool {
+    if shell.studio.borrow().on_start {
+        log::info!("close: on launch screen, leaving the app");
+        app.window().hide().ok();
+        slint::quit_event_loop().ok();
+        return false;
+    }
+    log::info!("close: closing project, staying on the launch screen");
+    if let Err(error) = shell.studio.borrow_mut().close_project() {
+        // Same as the File menu's Close project: the session stays, the
+        // toast from `close_project` is what the person sees.
+        log::warn!("close: project could not be saved: {error}");
+    }
+    shell.studio.borrow_mut().refresh_art();
+    shell.studio.borrow().publish(app, &shell.models);
+    true
 }
 
 /// [`run_with_project`], or [`smoke`] when `smoke` is set.
@@ -536,8 +561,9 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
         }
     });
     // The strip's own window buttons, on the platforms whose decorations
-    // were taken off. Close goes the way the File menu's Close does - the
-    // project is shut first, so an autosave in flight is not orphaned.
+    // were taken off. × from the editor closes the project (launch screen);
+    // × from the launch screen leaves the app. Exit / Quit is still the
+    // menu row and Ctrl+Q.
     app.on_titlebar_minimize({
         let weak = app.as_weak();
         move || {
@@ -549,50 +575,20 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     app.on_titlebar_close(|| {
         log::info!("close: titlebar X pressed");
         Shell::with(|shell, app| {
-            let outcome = close_window(
-                || shell.studio.borrow_mut().close_project(),
-                || {
-                    log::info!("close: project closed, hiding window");
-                    app.window().hide().ok();
-                    slint::quit_event_loop().ok();
-                    log::info!("close: quit_event_loop called");
-                },
-            );
-            if let Err(error) = outcome {
-                // The save failed and `close_project` left the session
-                // open, so the window stays up. Its notice is published
-                // here or nobody would see it.
-                log::warn!("close: not closing, project could not be saved: {error}");
-                shell.studio.borrow_mut().offer_quit_without_saving(error);
-                shell.studio.borrow_mut().refresh_art();
-                shell.studio.borrow().publish(&app, &shell.models);
-            }
+            let _ = close_project_or_quit(shell, &app);
         });
     });
-    // System-driven close (Alt+F4, taskbar close): the same road out, and
-    // refused the same way when the project cannot be saved.
+    // System-driven close (Alt+F4, taskbar close): the same road as ×.
     app.window().on_close_requested(|| {
         log::info!("close: system close request (Alt+F4 / taskbar)");
-        let saved = std::cell::Cell::new(true);
+        let keep = std::cell::Cell::new(true);
         Shell::with(|shell, app| {
-            let outcome = close_window(
-                || shell.studio.borrow_mut().close_project(),
-                || {
-                    slint::quit_event_loop().ok();
-                },
-            );
-            if let Err(error) = outcome {
-                saved.set(false);
-                log::warn!("close: not closing, project could not be saved: {error}");
-                shell.studio.borrow_mut().offer_quit_without_saving(error);
-                shell.studio.borrow_mut().refresh_art();
-                shell.studio.borrow().publish(&app, &shell.models);
-            }
+            keep.set(close_project_or_quit(shell, &app));
         });
-        if saved.get() {
-            slint::CloseRequestResponse::HideWindow
-        } else {
+        if keep.get() {
             slint::CloseRequestResponse::KeepWindowShown
+        } else {
+            slint::CloseRequestResponse::HideWindow
         }
     });
     // Maximised or not is read back on every resize rather than tracked:
