@@ -480,7 +480,7 @@
   "settings.packageOpened": "Concat {0} is downloaded and open in the package installer. Install it there, then start Concat again.",
   "settings.playhead": "Playhead",
   "settings.proxies": "Proxies",
-  "settings.proxiesHint": "Off, playback reads your files as they are. On, each video larger than HD gets a smaller copy, made once in the background, for smoother playback at Half and Quarter.",
+  "settings.proxiesHint": "On by default: each HD or larger video gets a smaller copy in the background so Half and Quarter play smoothly; export still uses the original. Off, playback reads your files as they are.",
   "settings.rose": "Rose",
   "settings.runsLocally": "Runs locally",
   "settings.scale": "Scale",

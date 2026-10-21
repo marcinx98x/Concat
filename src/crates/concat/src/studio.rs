@@ -3350,6 +3350,15 @@ impl Studio {
         self.media = bin;
     }
 
+    /// Proxies were just turned on in Settings: forget which media we
+    /// already considered (including HD files skipped under an older
+    /// threshold) and ask for proxies again.
+    pub(crate) fn requeue_proxies(&mut self) {
+        self.proxied.clear();
+        self.art_stamp = None;
+        self.request_media_art();
+    }
+
     /// Decodes art for every media item that has none yet: its pictures
     /// and the waveform of its default audio stream - and, for every clip
     /// that plays another of its media's streams, that stream's waveform
@@ -3359,10 +3368,10 @@ impl Studio {
             return;
         };
         let project_path = session.path().to_owned();
-        // With proxies on in Settings, a file larger than HD gets a proxy
-        // for playback and the filmstrips, written once on the scheduler's
-        // proxy lane; see concat_host::proxy. Asked once per file per
-        // project. Off, the default, nothing is written.
+        // With proxies on (the default), a file at HD or larger gets a
+        // proxy for playback and the filmstrips, written once on the
+        // scheduler's proxy lane; see concat_host::proxy. Asked once per
+        // file per project. Off, nothing is written.
         type Unproxied = (
             String,
             String,
@@ -3391,15 +3400,19 @@ impl Studio {
             })
             .collect();
         for (id, path, width, height, range, hdr) in unproxied {
-            concat_host::proxy::ensure(
+            // Only stamp when ensure accepted the file (HD+, or already
+            // writing). A false return must not block a later prefs/threshold
+            // change from trying again.
+            if concat_host::proxy::ensure(
                 std::path::Path::new(&project_path),
                 &path,
                 width,
                 height,
                 range,
                 hdr,
-            );
-            self.proxied.insert(id);
+            ) {
+                self.proxied.insert(id);
+            }
         }
         /// One job: the art key it fills, and what to decode.
         struct Want {

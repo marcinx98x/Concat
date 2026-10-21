@@ -31,9 +31,9 @@ use concat_core::frame::Frame;
 use crate::pool::{FrameRequest, ReaderPool};
 
 /// How many frame instants the prefetcher decodes ahead of the cursor.
-/// A quarter of a second at thirty: enough that a decode never lands
-/// after its frame is due, small enough that a seek wastes little.
-pub const AHEAD: u32 = 8;
+/// About half a second at thirty: soft H.264 of a 1080p WEB-DL needs more
+/// than a quarter-second of runway, and a seek still wastes little.
+pub const AHEAD: u32 = 16;
 
 /// How far a cursor may move on from the last one, in its own direction
 /// and at its own rate, and still be the same playback: its queue is kept
@@ -586,10 +586,10 @@ mod tests {
                 rate: 1.0,
             },
             1.0 / fps,
-            (11..19).map(moment).collect(),
+            (11..11 + i64::from(AHEAD)).map(moment).collect(),
         );
         prefetcher.drain();
-        assert_eq!(prefetcher.held_ahead(), 8);
+        assert_eq!(prefetcher.held_ahead(), AHEAD as usize);
         // Turned round at 14: 15.. are behind it now and go; 11..=14 stay
         // (14 within a frame's slack), and 13 down to 6 are asked for.
         prefetcher.advance(
@@ -738,8 +738,8 @@ mod tests {
         assert_eq!(pool.stats().since(warmed).decoded, 0, "frame 5 was ahead");
 
         // The cursor at 5 carries on from 0: the instants more than a frame
-        // behind it are released, 4..=8 stay, and of 6..=13 only 9..=13 -
-        // the ones not held already - are decoded and join them.
+        // behind it are released, nearby ones stay, and the new ahead
+        // runway joins them once each.
         prefetcher.advance(cursor(5), 1.0 / fps, moments(5));
         prefetcher.drain();
         let mut held: Vec<i64> = prefetcher
@@ -748,7 +748,11 @@ mod tests {
             .map(|time| (time * fps).round() as i64)
             .collect();
         held.sort_unstable();
-        assert_eq!(held, (4..=13).collect::<Vec<_>>(), "each held once");
+        assert_eq!(
+            held,
+            (4..=5 + i64::from(AHEAD)).collect::<Vec<_>>(),
+            "each held once"
+        );
 
         // A cursor far ahead: nothing held behind it survives, and an
         // instant queued for it that it has already passed is skipped -
@@ -764,7 +768,12 @@ mod tests {
         );
         prefetcher.advance(cursor(20), 1.0 / fps, stale);
         prefetcher.drain();
-        assert_eq!(prefetcher.held_ahead(), AHEAD as usize);
+        // A full runway ahead; a frame of slack can leave one or two extra.
+        let held = prefetcher.held_ahead();
+        assert!(
+            (AHEAD as usize..=AHEAD as usize + 2).contains(&held),
+            "held runway {held}"
+        );
         let before = pool.stats();
         pool.frame(&FrameRequest::new(&path, rate.time_of_frame(2), 8, 8))
             .expect("decodes");
