@@ -155,6 +155,21 @@ impl Studio {
                 plan.start = (cut - half).max(0.0) as f32;
             }
         }
+        // CapCut: on an existing lane, if the snapped span is taken, open a
+        // new lane above that row instead of shifting onto a neighbour.
+        if plan.new_lane.is_none() {
+            let track = self.row_track(plan.row)?;
+            let start = f64::from(plan.start);
+            let duration = f64::from(plan.duration);
+            let free = self
+                .timeline()
+                .nearest_free_start(&track.id, start, duration, &[]);
+            if (free - start).abs() >= 1e-9 {
+                // Tracks are stored bottom first. The lane immediately above
+                // UI row `r` is inserted after its model track, at `lanes - r`.
+                plan.new_lane = Some((lanes - plan.row) as usize);
+            }
+        }
         Some(plan)
     }
 

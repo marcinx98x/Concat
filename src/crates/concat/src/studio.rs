@@ -728,8 +728,8 @@ pub struct DropPlan {
     pub start: f32,
     pub duration: f32,
     pub row: i32,
-    /// Where to insert a lane when no existing lane in the category band
-    /// accepts this drop, in the model's bottom-first order.
+    /// Where to insert a lane when no band lane accepts the drop, or the
+    /// hovered lane cannot fit the clip, in the model's bottom-first order.
     pub new_lane: Option<usize>,
 }
 
