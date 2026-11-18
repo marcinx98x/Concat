@@ -13,9 +13,10 @@ import { ClipKind, TrackData, TrackSize } from "model.slint";
 // No label on a row: the lanes are untyped, so there is no kind to name, and
 // a lane's place in the stack is the only handle anything needs on it.
 //
-// Both a visibility and a mute toggle on every row, because a track is not
-// typed — the same lane can be carrying a video clip and an mp3 side by side,
-// and each needs its own switch.
+// Visibility and mute are separate because a track is not typed — the same
+// lane can carry a video clip and an mp3 side by side. The eye is only for
+// picture (preview/export composite); Rust sets `shows-eye` false on audio
+// and sound-layer lanes, where mute is the control that matters.
 //
 // The column scrolls with the lanes rather than on its own: the offset is the
 // caller's `track-scroll`, so the labels and the lanes cannot drift apart.
@@ -296,7 +297,9 @@ component Header inherits Rectangle {
                 }
             }
 
-            VerticalLayout {
+            // Eye hides picture from the composite. Audio and sound-layer
+            // lanes have nothing to hide that way — mute is the control.
+            if root.track.shows-eye: VerticalLayout {
                 alignment: center;
                 IconButton {
                     // Checked when the lane is *off*: the button is lit to say

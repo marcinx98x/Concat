@@ -284,6 +284,13 @@ impl Studio {
                 .map(|lane| {
                     let height = self.lane_height(lane);
                     let first = timeline.clips.iter().find(|clip| clip.track_id == lane.id);
+                    // Visibility only drops picture from the composite; on an
+                    // audio or sound-layer lane the eye would do nothing
+                    // audible, so the header keeps mute and hides the eye.
+                    let shows_eye = !matches!(
+                        first.map(|clip| clip.kind),
+                        Some(model::ClipKind::Audio | model::ClipKind::SoundLayer)
+                    );
                     let row = TrackData {
                         typed: first.is_some(),
                         kind: first.map_or(ClipKind::Video, |clip| kind_of(clip)),
@@ -295,6 +302,7 @@ impl Studio {
                         height,
                         top,
                         selected: self.selected_tracks.contains(&lane.id),
+                        shows_eye,
                     };
                     top += height;
                     row
